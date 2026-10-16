@@ -12,6 +12,7 @@ export interface CategoryOption {
   default?: boolean;
   defaultDescription?: string;
   hidden?: boolean;
+  reloadable?: boolean;
 }
 
 export type CategoryFlagName<T extends ToolCategory = ToolCategory> =
@@ -27,6 +28,7 @@ const categoryOverrides: Record<
     describe?: string;
     hidden?: boolean;
     offByDefault?: boolean;
+    reloadable?: boolean;
   }
 > = {
   [ToolCategory.INPUT]: {},
@@ -42,9 +44,9 @@ const categoryOverrides: Record<
     offByDefault: true,
   },
   [ToolCategory.EXTENSIONS]: {
-    describe:
-      'Set to true to include tools related to extensions. Note: This feature is currently only supported with a pipe connection. autoConnect, browserUrl, and wsEndpoint are not supported with this feature until 149 will be released.',
+    describe: 'Set to true to include tools related to extensions.',
     offByDefault: true,
+    reloadable: false,
   },
   [ToolCategory.THIRD_PARTY]: {
     describe:
@@ -67,6 +69,7 @@ function createOption(category: ToolCategory): CategoryOption {
   return {
     type: 'boolean',
     describe,
+    reloadable: true,
     ...overrides,
     // Off-by-default categories have no default so that they stay unset unless
     // passed explicitly. This keeps them out of conflict checks and lets

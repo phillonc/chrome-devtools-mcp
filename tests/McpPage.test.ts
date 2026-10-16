@@ -10,9 +10,8 @@ import {afterEach, describe, it} from 'node:test';
 import sinon from 'sinon';
 
 import type {TargetUniverse} from '../src/devtools/DevtoolsUtils.js';
-import {McpPage} from '../src/McpPage.js';
-import {replaceHtmlElementsWithUids} from '../src/McpPage.js';
-import {DevTools, Locator} from '../src/third_party/index.js';
+import {McpPage, replaceHtmlElementsWithUids} from '../src/McpPage.js';
+import {DevTools, Locator, ScreenRecorder} from '../src/third_party/index.js';
 import type {JSONSchema7Definition} from '../src/third_party/index.js';
 import {TextSnapshot} from '../src/TextSnapshot.js';
 import type {TextSnapshotNode} from '../src/types.js';
@@ -328,6 +327,11 @@ describe('McpPage', () => {
       sinon.assert.notCalled(target.page);
       sinon.assert.notCalled(target.asPage);
       assert.throws(() => mcpPage.pptrPage, /not initialized/);
+      assert.throws(
+        () => mcpPage.getThirdPartyDeveloperTools(),
+        /not initialized/,
+      );
+      assert.throws(() => mcpPage.getWebMcpTools(), /not initialized/);
       assert.strictEqual(mcpPage.url(), 'https://target-only.example.com');
       assert.strictEqual(mcpPage.getTitle(), 'Target Title');
 
@@ -389,6 +393,85 @@ describe('McpPage', () => {
         runBeforeUnload: false,
       });
       sinon.assert.notCalled(pptrPage.emulateFocusedPage);
+    });
+
+    it('stops and clears an active screenRecorder on dispose()', async () => {
+      const target = createMockPuppeteerTarget();
+      const mcpPage = new McpPage(target, 1, {
+        hasNetworkBlockOrAllowlist: false,
+        locatorClass: Locator,
+      });
+      const recorder = sinon.createStubInstance(ScreenRecorder);
+      recorder.stop.resolves();
+      mcpPage.setScreenRecorder({recorder, filePath: '/tmp/video.mp4'});
+
+      mcpPage.dispose();
+
+      sinon.assert.calledOnceWithExactly(recorder.stop);
+      assert.strictEqual(mcpPage.getScreenRecorder(), null);
+    });
+  });
+
+  describe('getTitle()', () => {
+    afterEach(() => {
+      sinon.restore();
+    });
+
+    function createPage(url: string, title: string): McpPage {
+      const target = createMockPuppeteerTarget({url, title});
+      return new McpPage(target, 1, {
+        hasNetworkBlockOrAllowlist: false,
+        locatorClass: Locator,
+      });
+    }
+
+    function targetInfo(url: string, title: string) {
+      return {
+        targetId: '<mock-target-id>',
+        type: 'page',
+        title,
+        url,
+        attached: true,
+        canAccessOpener: false,
+      };
+    }
+
+    it('prefers fresh target info over cached target info', () => {
+      const mcpPage = createPage(
+        'http://127.0.0.1:8080/titled.html',
+        '127.0.0.1:8080/titled.html',
+      );
+      assert.strictEqual(
+        mcpPage.getTitle(
+          targetInfo('http://127.0.0.1:8080/titled.html', 'Real Title'),
+        ),
+        'Real Title',
+      );
+    });
+
+    it('ignores Chrome URL placeholder titles', () => {
+      assert.strictEqual(
+        createPage(
+          'http://127.0.0.1:8080/titled.html',
+          '127.0.0.1:8080/titled.html',
+        ).getTitle(),
+        '',
+      );
+      assert.strictEqual(
+        createPage('https://example.com/', 'example.com').getTitle(),
+        '',
+      );
+      assert.strictEqual(
+        createPage('about:blank', 'about:blank').getTitle(),
+        '',
+      );
+    });
+
+    it('exposes the target id', () => {
+      assert.strictEqual(
+        createPage('https://example.com', '').targetId,
+        '<mock-target-id>',
+      );
     });
   });
 
@@ -540,24 +623,74 @@ describe('McpPage', () => {
       });
     });
 
-    it('calls emulateMediaFeatures with dark color scheme', async () => {
-      const {mcpPage, pptrPage} = await createMcpPage();
-      await mcpPage.emulate({colorScheme: 'dark'});
-      assert.strictEqual(mcpPage.colorScheme, 'dark');
-      sinon.assert.calledOnceWithExactly(pptrPage.emulateMediaFeatures, [
-        {name: 'prefers-color-scheme', value: 'dark'},
-      ]);
-    });
+    describe('media features', () => {
+      it('emulates all media features in a single call', async () => {
+        const {mcpPage, pptrPage} = await createMcpPage();
+        await mcpPage.emulate({
+          colorScheme: 'dark',
+          forcedColors: 'active',
+          prefersContrast: 'more',
+          prefersReducedMotion: 'reduce',
+        });
+        assert.strictEqual(mcpPage.colorScheme, 'dark');
+        assert.strictEqual(mcpPage.forcedColors, 'active');
+        assert.strictEqual(mcpPage.prefersContrast, 'more');
+        assert.strictEqual(mcpPage.prefersReducedMotion, 'reduce');
+        sinon.assert.calledOnceWithExactly(pptrPage.emulateMediaFeatures, [
+          {name: 'prefers-color-scheme', value: 'dark'},
+          {name: 'forced-colors', value: 'active'},
+          {name: 'prefers-contrast', value: 'more'},
+          {name: 'prefers-reduced-motion', value: 'reduce'},
+        ]);
+      });
 
-    it('calls emulateMediaFeatures with empty string to reset color scheme', async () => {
-      const {mcpPage, pptrPage} = await createMcpPage();
-      await mcpPage.emulate({colorScheme: 'dark'});
-      await mcpPage.emulate({colorScheme: 'auto'});
-      assert.strictEqual(mcpPage.colorScheme, null);
-      sinon.assert.calledTwice(pptrPage.emulateMediaFeatures);
-      sinon.assert.calledWithExactly(pptrPage.emulateMediaFeatures.secondCall, [
-        {name: 'prefers-color-scheme', value: ''},
-      ]);
+      it('resets media features set to auto', async () => {
+        const {mcpPage, pptrPage} = await createMcpPage();
+        await mcpPage.emulate({
+          colorScheme: 'dark',
+          forcedColors: 'active',
+          prefersContrast: 'more',
+          prefersReducedMotion: 'reduce',
+        });
+        await mcpPage.emulate({
+          colorScheme: 'auto',
+          forcedColors: 'auto',
+          prefersContrast: 'auto',
+          prefersReducedMotion: 'auto',
+        });
+        assert.strictEqual(mcpPage.colorScheme, null);
+        assert.strictEqual(mcpPage.forcedColors, null);
+        assert.strictEqual(mcpPage.prefersContrast, null);
+        assert.strictEqual(mcpPage.prefersReducedMotion, null);
+        sinon.assert.calledTwice(pptrPage.emulateMediaFeatures);
+        sinon.assert.calledWithExactly(
+          pptrPage.emulateMediaFeatures.secondCall,
+          [
+            {name: 'prefers-color-scheme', value: ''},
+            {name: 'forced-colors', value: ''},
+            {name: 'prefers-contrast', value: ''},
+            {name: 'prefers-reduced-motion', value: ''},
+          ],
+        );
+      });
+
+      it('resets omitted media features', async () => {
+        const {mcpPage, pptrPage} = await createMcpPage();
+        await mcpPage.emulate({forcedColors: 'active'});
+        await mcpPage.emulate({prefersContrast: 'less'});
+        assert.strictEqual(mcpPage.forcedColors, null);
+        assert.strictEqual(mcpPage.prefersContrast, 'less');
+        sinon.assert.calledTwice(pptrPage.emulateMediaFeatures);
+        sinon.assert.calledWithExactly(
+          pptrPage.emulateMediaFeatures.secondCall,
+          [
+            {name: 'prefers-color-scheme', value: ''},
+            {name: 'forced-colors', value: ''},
+            {name: 'prefers-contrast', value: 'less'},
+            {name: 'prefers-reduced-motion', value: ''},
+          ],
+        );
+      });
     });
 
     it('calls setViewport with the given dimensions merged with defaults', async () => {
@@ -854,6 +987,7 @@ describe('McpPage', () => {
     it('creates and attaches commentBridge when openDevTools is called', async () => {
       const {mcpPage, pptrPage} = await createMcpPage();
       const devtoolsPage = createMockPuppeteerPage();
+      devtoolsPage.evaluate.resolves(true);
       pptrPage.openDevTools.resolves(devtoolsPage);
 
       assert.strictEqual(mcpPage.commentBridge, undefined);
@@ -862,6 +996,28 @@ describe('McpPage', () => {
       assert.strictEqual(result, devtoolsPage);
       assert.notStrictEqual(mcpPage.commentBridge, undefined);
       sinon.assert.calledOnce(devtoolsPage.exposeFunction);
+    });
+
+    it('returns the commentBridge when the DevTools page has a CD4A bridge', async () => {
+      const {mcpPage} = await createMcpPage();
+      const devtoolsPage = createMockPuppeteerPage();
+      devtoolsPage.evaluate.resolves(true);
+
+      const bridge = await mcpPage.ensureDevToolsCommentBridge(devtoolsPage);
+
+      assert.notStrictEqual(bridge, undefined);
+      assert.strictEqual(bridge, mcpPage.commentBridge);
+    });
+
+    it('returns undefined when the DevTools page has no CD4A bridge', async () => {
+      const {mcpPage} = await createMcpPage();
+      const devtoolsPage = createMockPuppeteerPage();
+      devtoolsPage.evaluate.resolves(false);
+
+      const bridge = await mcpPage.ensureDevToolsCommentBridge(devtoolsPage);
+
+      assert.strictEqual(bridge, undefined);
+      sinon.assert.notCalled(devtoolsPage.exposeFunction);
     });
 
     it('disposes commentBridge on mcpPage.dispose()', async () => {
@@ -886,7 +1042,8 @@ describe('McpPage', () => {
       const {mcpPage, pptrPage} = await createMcpPage();
       pptrPage.hasDevTools.resolves(true);
       const devtoolsPage = createMockPuppeteerPage();
-      devtoolsPage.evaluate.resolves({
+      devtoolsPage.evaluate.resolves(true);
+      devtoolsPage.evaluate.onThirdCall().resolves({
         cdpRequestId: 'req-1',
         cdpBackendNodeId: 10,
       });
@@ -901,7 +1058,7 @@ describe('McpPage', () => {
       });
       assert.notStrictEqual(mcpPage.commentBridge, undefined);
       sinon.assert.calledOnce(devtoolsPage.exposeFunction);
-      sinon.assert.calledTwice(devtoolsPage.evaluate);
+      sinon.assert.calledThrice(devtoolsPage.evaluate);
     });
   });
 
@@ -1493,6 +1650,34 @@ describe('McpPage', () => {
         () =>
           mcpPage.executeThirdPartyDeveloperTool('webmcp_tool', {}, response),
         /Execution failed in page/,
+      );
+    });
+
+    it('throws the exception description when the WebMCP tool throws in executeThirdPartyDeveloperTool()', async () => {
+      const {mcpPage, pptrPage} = await createMcpPage();
+      const mockTool = createMockWebMCPTool({
+        name: 'webmcp_tool',
+        annotations: {debugging: true},
+      });
+      mockTool.execute.resolves({
+        id: 'call-1',
+        status: 'Error',
+        errorText: '',
+        exception: {
+          type: 'object',
+          subtype: 'error',
+          className: 'Error',
+          description: 'Error: boom\n    at foo (app.js:1:1)',
+          objectId: '1',
+        },
+      });
+      pptrPage.webmcp.tools.returns([mockTool]);
+      const response = createMockMcpResponse();
+
+      await assert.rejects(
+        () =>
+          mcpPage.executeThirdPartyDeveloperTool('webmcp_tool', {}, response),
+        {message: 'Error: boom\n    at foo (app.js:1:1)'},
       );
     });
 

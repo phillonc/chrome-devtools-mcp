@@ -30,6 +30,20 @@ const maxNameLengthSchema = zod
     `Maximum length of names before truncation. Defaults to ${MAX_NAME_LENGTH}.`,
   );
 
+const pageIdxSchema = zod
+  .number()
+  .int()
+  .nonnegative()
+  .optional()
+  .describe('The page index for pagination.');
+
+const pageSizeSchema = zod
+  .number()
+  .int()
+  .positive()
+  .optional()
+  .describe('The page size for pagination.');
+
 export const takeHeapSnapshot = definePageTool(() => ({
   name: 'take_heapsnapshot',
   description: `Capture a heap snapshot of the target page. Use to analyze the memory distribution of JavaScript objects and debug memory leaks.`,
@@ -64,7 +78,7 @@ export const takeHeapSnapshot = definePageTool(() => ({
 export const getHeapSnapshotSummary = defineTool(() => ({
   name: 'get_heapsnapshot_summary',
   description:
-    'Loads a memory heapsnapshot and returns snapshot summary stats, including native contexts and their sizes, and retained by context summary.',
+    'Loads and caches a memory heapsnapshot and returns snapshot summary stats, including native contexts and their sizes, and retained by context summary.',
   annotations: {
     category: ToolCategory.MEMORY,
     readOnlyHint: true,
@@ -106,7 +120,7 @@ export const getHeapSnapshotSummary = defineTool(() => ({
 export const getHeapSnapshotDetails = defineTool(() => ({
   name: 'get_heapsnapshot_details',
   description:
-    'Loads a memory heapsnapshot and returns all available information including statistics, static data, and aggregated node information. Supports pagination for aggregates.',
+    'Loads and caches a memory heapsnapshot and returns all available information including statistics, static data, and aggregated node information. Supports pagination for aggregates.',
   annotations: {
     category: ToolCategory.MEMORY,
     readOnlyHint: true,
@@ -124,12 +138,17 @@ export const getHeapSnapshotDetails = defineTool(() => ({
       .describe(
         'The object ID (nodeId) of the specific native context to filter by when filterName is attributedToSpecificNativeContext.',
       ),
+    maxNameLength: maxNameLengthSchema,
     pageIdx: zod
       .number()
+      .int()
+      .nonnegative()
       .optional()
       .describe('The page index for pagination of aggregates.'),
     pageSize: zod
       .number()
+      .int()
+      .positive()
       .optional()
       .describe('The page size for pagination of aggregates.'),
   },
@@ -147,6 +166,7 @@ export const getHeapSnapshotDetails = defineTool(() => ({
     response.setHeapSnapshotAggregates(aggregates, {
       pageIdx: request.params.pageIdx,
       pageSize: request.params.pageSize,
+      maxNameLength: request.params.maxNameLength,
     });
   },
 }));
@@ -154,7 +174,7 @@ export const getHeapSnapshotDetails = defineTool(() => ({
 export const getHeapSnapshotClassNodes = defineTool(() => ({
   name: 'get_heapsnapshot_class_nodes',
   description:
-    'Loads a memory heapsnapshot and returns instances of a specific class with their IDs.',
+    'Loads and caches a memory heapsnapshot and returns instances of a specific class with their IDs.',
   annotations: {
     category: ToolCategory.MEMORY,
     readOnlyHint: true,
@@ -174,8 +194,8 @@ export const getHeapSnapshotClassNodes = defineTool(() => ({
         'The object ID (nodeId) of the specific native context to filter by when filterName is attributedToSpecificNativeContext.',
       ),
     maxNameLength: maxNameLengthSchema,
-    pageIdx: zod.number().optional().describe('The page index for pagination.'),
-    pageSize: zod.number().optional().describe('The page size for pagination.'),
+    pageIdx: pageIdxSchema,
+    pageSize: pageSizeSchema,
   },
   blockedByDialog: false,
   verifyFilesSchema: {
@@ -200,7 +220,7 @@ export const getHeapSnapshotClassNodes = defineTool(() => ({
 export const getHeapSnapshotRetainers = defineTool(() => ({
   name: 'get_heapsnapshot_retainers',
   description:
-    'Loads a memory heapsnapshot and returns retainers for a specific node ID.',
+    'Loads and caches a memory heapsnapshot and returns retainers for a specific node ID.',
   annotations: {
     category: ToolCategory.MEMORY,
     readOnlyHint: true,
@@ -214,8 +234,8 @@ export const getHeapSnapshotRetainers = defineTool(() => ({
     filePath: zod.string().describe('A path to a .heapsnapshot file to read.'),
     nodeId: zod.number().describe('The node ID to get retainers for.'),
     maxNameLength: maxNameLengthSchema,
-    pageIdx: zod.number().optional().describe('The page index for pagination.'),
-    pageSize: zod.number().optional().describe('The page size for pagination.'),
+    pageIdx: pageIdxSchema,
+    pageSize: pageSizeSchema,
   },
   handler: async (request, response, context) => {
     const retainers = await context.getHeapSnapshotRetainers(
@@ -234,7 +254,7 @@ export const getHeapSnapshotRetainers = defineTool(() => ({
 export const closeHeapSnapshot = defineTool(() => ({
   name: 'close_heapsnapshot',
   description:
-    'Closes a previously loaded memory heapsnapshot, freeing its memory.',
+    'Closes a previously loaded and cached memory heapsnapshot, freeing its memory.',
   annotations: {
     category: ToolCategory.MEMORY,
     readOnlyHint: false,
@@ -265,7 +285,7 @@ export const closeHeapSnapshot = defineTool(() => ({
 export const getHeapSnapshotRetainingPaths = defineTool(() => ({
   name: 'get_heapsnapshot_retaining_paths',
   description:
-    'Loads a memory heapsnapshot and returns retaining paths for a specific node ID. This helps to understand why a node is not being garbage collected.',
+    'Loads and caches a memory heapsnapshot and returns retaining paths for a specific node ID. This helps to understand why a node is not being garbage collected.',
   annotations: {
     category: ToolCategory.MEMORY,
     readOnlyHint: true,
@@ -310,7 +330,7 @@ export const getHeapSnapshotRetainingPaths = defineTool(() => ({
 export const getHeapSnapshotEdges = defineTool(() => ({
   name: 'get_heapsnapshot_edges',
   description:
-    'Loads a memory heapsnapshot and returns outgoing edges (references) for a specific node ID.',
+    'Loads and caches a memory heapsnapshot and returns outgoing edges (references) for a specific node ID.',
   annotations: {
     category: ToolCategory.MEMORY,
     readOnlyHint: true,
@@ -335,8 +355,8 @@ export const getHeapSnapshotEdges = defineTool(() => ({
       .optional()
       .describe('Whether to exclude primitive target nodes. Default is true.'),
     maxNameLength: maxNameLengthSchema,
-    pageIdx: zod.number().optional().describe('The page index for pagination.'),
-    pageSize: zod.number().optional().describe('The page size for pagination.'),
+    pageIdx: pageIdxSchema,
+    pageSize: pageSizeSchema,
   },
   handler: async (request, response, context) => {
     const edges = await context.getHeapSnapshotEdges(
@@ -361,7 +381,7 @@ export const getHeapSnapshotEdges = defineTool(() => ({
 export const getHeapSnapshotDominators = defineTool(() => ({
   name: 'get_heapsnapshot_dominators',
   description:
-    'Loads a memory heapsnapshot and returns the dominator chain for a specific node ID. This helps to identify which objects are keeping the target node alive.',
+    'Loads and caches a memory heapsnapshot and returns the dominator chain for a specific node ID. This helps to identify which objects are keeping the target node alive.',
   annotations: {
     category: ToolCategory.MEMORY,
     readOnlyHint: true,
@@ -393,7 +413,7 @@ export const getHeapSnapshotDominators = defineTool(() => ({
 export const compareHeapSnapshots = defineTool(() => ({
   name: 'compare_heapsnapshots',
   description:
-    'Loads two memory heapsnapshots and returns the comparison. If classIndex is provided, returns detailed diff for that class, otherwise returns summary diff.',
+    'Loads and caches two memory heapsnapshots and returns the comparison. If classIndex is provided, returns detailed diff for that class, otherwise returns summary diff.',
   annotations: {
     category: ToolCategory.MEMORY,
     readOnlyHint: true,
@@ -416,6 +436,9 @@ export const compareHeapSnapshots = defineTool(() => ({
       .describe(
         'Optional 0-based index of the class in the summary list to filter results, showing individual objects.',
       ),
+    maxNameLength: maxNameLengthSchema,
+    pageIdx: pageIdxSchema,
+    pageSize: pageSizeSchema,
   },
   blockedByDialog: false,
   handler: async (request, response, context) => {
@@ -425,13 +448,19 @@ export const compareHeapSnapshots = defineTool(() => ({
         request.params.currentFilePath,
         request.params.classIndex,
       );
-      response.setHeapSnapshotDetailedClassDiff(classDiffResult);
+      response.setHeapSnapshotDetailedClassDiff(classDiffResult, {
+        maxNameLength: request.params.maxNameLength,
+      });
     } else {
       const diff = await context.getHeapSnapshotClassDiffs(
         request.params.baseFilePath,
         request.params.currentFilePath,
       );
-      response.setHeapSnapshotClassDiffs(diff);
+      response.setHeapSnapshotClassDiffs(diff, {
+        pageIdx: request.params.pageIdx,
+        pageSize: request.params.pageSize,
+        maxNameLength: request.params.maxNameLength,
+      });
     }
   },
 }));
@@ -439,7 +468,7 @@ export const compareHeapSnapshots = defineTool(() => ({
 export const getHeapSnapshotDuplicateStrings = defineTool(() => ({
   name: 'get_heapsnapshot_duplicate_strings',
   description:
-    'Loads a memory heapsnapshot and returns duplicate strings grouped by their value.',
+    'Loads and caches a memory heapsnapshot and returns duplicate strings grouped by their value.',
   annotations: {
     category: ToolCategory.MEMORY,
     readOnlyHint: true,
@@ -451,8 +480,8 @@ export const getHeapSnapshotDuplicateStrings = defineTool(() => ({
   },
   schema: {
     filePath: zod.string().describe('A path to a .heapsnapshot file to read.'),
-    pageIdx: zod.number().optional().describe('The page index for pagination.'),
-    pageSize: zod.number().optional().describe('The page size for pagination.'),
+    pageIdx: pageIdxSchema,
+    pageSize: pageSizeSchema,
     maxNameLength: maxNameLengthSchema,
   },
   handler: async (request, response, context) => {
@@ -471,7 +500,7 @@ export const getHeapSnapshotDuplicateStrings = defineTool(() => ({
 export const getHeapSnapshotObjectDetails = defineTool(() => ({
   name: 'get_heapsnapshot_object_details',
   description:
-    'Loads a memory heapsnapshot and returns detailed information about a specific object by its node ID, including size, type, distance, and DOM detachedness.',
+    'Loads and caches a memory heapsnapshot and returns detailed information about a specific object by its node ID, including size, type, distance, and DOM detachedness.',
   annotations: {
     category: ToolCategory.MEMORY,
     readOnlyHint: true,
@@ -501,7 +530,7 @@ export const getHeapSnapshotObjectDetails = defineTool(() => ({
 export const queryHeapSnapshotObjects = defineTool(() => ({
   name: 'query_heapsnapshot_objects',
   description:
-    'Loads a memory heapsnapshot and queries objects matching specific filters (className, propertyName, nodeType, retainedSize, selfSize, isDetached, sortBy).',
+    'Loads and caches a memory heapsnapshot and queries objects matching specific filters (className, propertyName, nodeType, retainedSize, selfSize, isDetached, sortBy).',
   annotations: {
     category: ToolCategory.MEMORY,
     readOnlyHint: true,
@@ -539,8 +568,8 @@ export const queryHeapSnapshotObjects = defineTool(() => ({
       .enum(['retainedSize', 'selfSize', 'id'])
       .optional()
       .describe('Sort order for results. Default is retainedSize.'),
-    pageIdx: zod.number().optional().describe('The page index for pagination.'),
-    pageSize: zod.number().optional().describe('The page size for pagination.'),
+    pageIdx: pageIdxSchema,
+    pageSize: pageSizeSchema,
     maxNameLength: maxNameLengthSchema,
   },
   handler: async (request, response, context) => {
@@ -570,7 +599,7 @@ export const queryHeapSnapshotObjects = defineTool(() => ({
 export const analyzeHeapSnapshotContexts = defineTool(() => ({
   name: 'analyze_heapsnapshot_contexts',
   description:
-    'Loads a memory heapsnapshot to identify and rank closure contexts holding dead captured fields—variables no remaining live closure can read. Scopes are ranked globally by the retained size of these dead values to provide a prioritizing heuristic, rather than an exact measure of reclaimable bytes.',
+    'Loads and caches a memory heapsnapshot to identify and rank closure contexts holding dead captured fields—variables no remaining live closure can read. Scopes are ranked globally by the retained size of these dead values to provide a prioritizing heuristic, rather than an exact measure of reclaimable bytes.',
   annotations: {
     category: ToolCategory.MEMORY,
     readOnlyHint: true,

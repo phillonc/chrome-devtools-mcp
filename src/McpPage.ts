@@ -16,8 +16,8 @@ import {
   type UncaughtError,
 } from './collectors/PageCollector.js';
 import {TextSnapshot} from './TextSnapshot.js';
-import type {Locator} from './third_party/index.js';
 import {
+  type Locator,
   PredefinedNetworkConditions,
   type Dialog,
   type ElementHandle,
@@ -37,10 +37,14 @@ import type {
   DevToolsData,
   MatchedStyles,
   Response,
+  ScreenRecorderData,
 } from './tools/ToolDefinition.js';
 import type {
   EmulationSettings,
+  ForcedColors,
   GeolocationOptions,
+  PrefersContrast,
+  PrefersReducedMotion,
   TextSnapshotNode,
 } from './types.js';
 import {logger} from './utils/logger.js';
@@ -51,10 +55,9 @@ import {
   type DialogAction,
 } from './utils/WaitForHelper.js';
 
-const DEFAULT_TIMEOUT = 5_000;
-const NAVIGATION_TIMEOUT = 10_000;
-
-export function replaceHtmlElementsWithUids(schema: JSONSchema7Definition) {
+export function replaceHtmlElementsWithUids(
+  schema: JSONSchema7Definition,
+): void {
   if (typeof schema === 'boolean') {
     return;
   }
@@ -113,6 +116,22 @@ function isDebuggingWebMcpTool(tool: WebMCPTool): boolean {
   );
 }
 
+const DEFAULT_TIMEOUT = 5_000;
+const NAVIGATION_TIMEOUT = 10_000;
+
+/**
+ * Chrome reports a URL-derived placeholder as the target title until the
+ * document provides one. The placeholder omits the `http://` / `https://`
+ * scheme and the trailing slash of a bare hostname.
+ */
+function isPlaceholderTitle(title: string, url: string): boolean {
+  if (title === url) {
+    return true;
+  }
+  const withoutScheme = url.replace(/^https?:\/\//, '');
+  return title === withoutScheme || title === withoutScheme.replace(/\/$/, '');
+}
+
 function isBackendNodeId(
   id: unknown,
 ): id is DevTools.Protocol.DOM.BackendNodeId {
@@ -151,6 +170,9 @@ export class McpPage implements ContextPage {
   // Dialog
   #dialog?: Dialog;
   #dialogHandler: (dialog: Dialog) => void;
+
+  // Screencast
+  #screenRecorder: ScreenRecorderData | null = null;
 
   eventBasedThirdPartyTools: ToolGroups = [];
 
@@ -221,13 +243,29 @@ export class McpPage implements ContextPage {
   }
 
   url(): string {
-    return this.#pptrPage ? this.#pptrPage.url() : this.target.url();
+    return this.#pptrPage?.url() ?? this.target.url();
   }
 
-  getTitle(): string {
+  get targetId(): string {
     // @ts-expect-error internal types
-    const info = this.target._getTargetInfo();
-    return info.title !== this.target.url() ? info.title : '';
+    const info: Protocol.Target.TargetInfo = this.target._getTargetInfo();
+    return info.targetId;
+  }
+
+  /**
+   * Returns the page title or an empty string if the target only has Chrome's
+   * URL-based placeholder title.
+   *
+   * Puppeteer's cached target info is only refreshed by
+   * `Target.targetInfoChanged`, which Chrome emits on navigation commit (before
+   * the document title is known) but not on title changes. Callers should pass
+   * fresh target info (e.g., from `Target.getTargets`) when available.
+   */
+  getTitle(freshTargetInfo?: Protocol.Target.TargetInfo): string {
+    // @ts-expect-error internal types
+    const cachedInfo: Protocol.Target.TargetInfo = this.target._getTargetInfo();
+    const info = freshTargetInfo ?? cachedInfo;
+    return isPlaceholderTitle(info.title, info.url) ? '' : info.title;
   }
 
   isClosed(): boolean {
@@ -255,7 +293,7 @@ export class McpPage implements ContextPage {
       throw new Error(`McpPage (id=${this.id}) has already been disposed.`);
     }
     if (this.#initPromise) {
-      return this.#initPromise;
+      return await this.#initPromise;
     }
     this.#initPromise = this.#doInit();
     try {
@@ -337,6 +375,14 @@ export class McpPage implements ContextPage {
     this.#dialog = undefined;
   }
 
+  getScreenRecorder(): ScreenRecorderData | null {
+    return this.#screenRecorder;
+  }
+
+  setScreenRecorder(data: ScreenRecorderData | null): void {
+    this.#screenRecorder = data;
+  }
+
   throwIfDialogOpen(): void {
     if (this.#dialog && !this.#dialog.handled) {
       throw new Error(
@@ -346,10 +392,7 @@ export class McpPage implements ContextPage {
   }
 
   #getDebuggingWebMcpToolGroups(): ToolGroups {
-    if (!this.#pptrPage) {
-      return [];
-    }
-    const webmcpTools = this.#pptrPage.webmcp
+    const webmcpTools = this.pptrPage.webmcp
       .tools()
       .filter(isDebuggingWebMcpTool);
     if (webmcpTools.length === 0) {
@@ -516,16 +559,20 @@ export class McpPage implements ContextPage {
     return this.#commentBridge;
   }
 
+  /**
+   * Returns the comment bridge attached to the DevTools page, or undefined if
+   * the DevTools page does not support DevTools comments.
+   */
   async ensureDevToolsCommentBridge(
     devtoolsPage: Page,
-  ): Promise<DevToolsCommentBridge> {
+  ): Promise<DevToolsCommentBridge | undefined> {
     if (!this.#commentBridge) {
       this.#commentBridge = new DevToolsCommentBridge({
         onNotification: this.#onNotification,
       });
     }
-    await this.#commentBridge.attach(devtoolsPage);
-    return this.#commentBridge;
+    const attached = await this.#commentBridge.attach(devtoolsPage);
+    return attached ? this.#commentBridge : undefined;
   }
 
   async getDevToolsPage(): Promise<Page | undefined> {
@@ -588,6 +635,18 @@ export class McpPage implements ContextPage {
     return this.emulationSettings.colorScheme ?? null;
   }
 
+  get forcedColors(): ForcedColors | null {
+    return this.emulationSettings.forcedColors ?? null;
+  }
+
+  get prefersContrast(): PrefersContrast | null {
+    return this.emulationSettings.prefersContrast ?? null;
+  }
+
+  get prefersReducedMotion(): PrefersReducedMotion | null {
+    return this.emulationSettings.prefersReducedMotion ?? null;
+  }
+
   // Public for testability: tests spy on this method to verify throttle multipliers.
   createWaitForHelper(
     cpuMultiplier: number,
@@ -617,6 +676,13 @@ export class McpPage implements ContextPage {
     this.#disposed = true;
     this.#commentBridge?.dispose();
     this.#commentBridge = undefined;
+    if (this.#screenRecorder) {
+      const {recorder} = this.#screenRecorder;
+      this.#screenRecorder = null;
+      void recorder.stop().catch(e => {
+        logger?.('Failed to stop screencast recording on dispose', e);
+      });
+    }
     this.#pptrPage?.off('dialog', this.#dialogHandler);
     this.#networkCollector?.dispose();
     this.#consoleCollector?.dispose();
@@ -637,9 +703,13 @@ export class McpPage implements ContextPage {
       .tools()
       .find(t => t.name === toolName && isDebuggingWebMcpTool(t));
     if (webmcpTool) {
-      const {status, output, errorText} = await webmcpTool.execute(params);
+      const {status, output, errorText, exception} =
+        await webmcpTool.execute(params);
       if (status !== 'Completed') {
-        throw new Error(errorText || `Tool execution failed: ${status}`);
+        const error = exception?.description ?? exception?.value ?? errorText;
+        throw new Error(
+          error ? String(error) : `Tool execution failed: ${status}`,
+        );
       }
       if (output !== undefined) {
         response.appendResponseLine(JSON.stringify(output, null, 2));
@@ -687,7 +757,7 @@ export class McpPage implements ContextPage {
 
         const stashedElements: Element[] = [];
 
-        const stashDOMElement = (el: Element) => {
+        const stashDOMElement = (el: Element): {stashedId: string} => {
           stashedElements.push(el);
           return {
             stashedId: `stashed-${stashedElements.length - 1}`,
@@ -845,7 +915,7 @@ export class McpPage implements ContextPage {
           node.stashedId.startsWith('stashed-') &&
           Object.keys(node).length === 1
         ) {
-          const index = parseInt(node.stashedId.split('-')[1]);
+          const index = parseInt(node.stashedId.split('-')[1], 10);
           return {uid: cdpElementIds[index]};
         }
         const resultObj: Record<string, unknown> = {};
@@ -876,7 +946,7 @@ export class McpPage implements ContextPage {
     if (!node) {
       throw new Error(`Element uid "${uid}" not found on page ${this.id}.`);
     }
-    return this.#resolveElementHandle(node, uid);
+    return await this.#resolveElementHandle(node, uid);
   }
 
   async #resolveElementHandle(
@@ -897,7 +967,7 @@ export class McpPage implements ContextPage {
     }
   }
 
-  getAXNodeByUid(uid: string) {
+  getAXNodeByUid(uid: string): TextSnapshotNode | undefined {
     return this.textSnapshot?.idToNode.get(uid);
   }
 
@@ -1020,7 +1090,6 @@ export class McpPage implements ContextPage {
       await this.ensureDevToolsCommentBridge(devtoolsPage);
       const {cdpRequestId, cdpBackendNodeId} = await devtoolsPage.evaluate(
         async () => {
-          window.universe?.cd4aBridge?.setAgentAttached(true);
           // @ts-expect-error no types
           const UI = await import('/bundled/ui/legacy/legacy.js');
           // @ts-expect-error no types
@@ -1044,9 +1113,24 @@ export class McpPage implements ContextPage {
     return {};
   }
 
-  async restoreEmulation() {
+  async restoreEmulation(): Promise<void> {
     const currentSetting = this.emulationSettings;
     await this.emulate(currentSetting);
+  }
+
+  async #emulateMediaFeatures(settings: EmulationSettings): Promise<void> {
+    // `page.emulateMediaFeatures` replaces all previously emulated media
+    // features, so every supported feature is sent on each call. An empty
+    // value disables the override for that feature.
+    await this.pptrPage.emulateMediaFeatures([
+      {name: 'prefers-color-scheme', value: settings.colorScheme ?? ''},
+      {name: 'forced-colors', value: settings.forcedColors ?? ''},
+      {name: 'prefers-contrast', value: settings.prefersContrast ?? ''},
+      {
+        name: 'prefers-reduced-motion',
+        value: settings.prefersReducedMotion ?? '',
+      },
+    ]);
   }
 
   async emulate(options: {
@@ -1055,6 +1139,9 @@ export class McpPage implements ContextPage {
     geolocation?: GeolocationOptions;
     userAgent?: string;
     colorScheme?: 'dark' | 'light' | 'auto';
+    forcedColors?: ForcedColors | 'auto';
+    prefersContrast?: PrefersContrast | 'auto';
+    prefersReducedMotion?: PrefersReducedMotion | 'auto';
     viewport?: Viewport;
     extraHttpHeaders?: Record<string, string> | undefined;
   }): Promise<void> {
@@ -1124,16 +1211,33 @@ export class McpPage implements ContextPage {
     }
 
     if (!options.colorScheme || options.colorScheme === 'auto') {
-      await page.emulateMediaFeatures([
-        {name: 'prefers-color-scheme', value: ''},
-      ]);
       delete newSettings.colorScheme;
     } else {
-      await page.emulateMediaFeatures([
-        {name: 'prefers-color-scheme', value: options.colorScheme},
-      ]);
       newSettings.colorScheme = options.colorScheme;
     }
+
+    if (!options.forcedColors || options.forcedColors === 'auto') {
+      delete newSettings.forcedColors;
+    } else {
+      newSettings.forcedColors = options.forcedColors;
+    }
+
+    if (!options.prefersContrast || options.prefersContrast === 'auto') {
+      delete newSettings.prefersContrast;
+    } else {
+      newSettings.prefersContrast = options.prefersContrast;
+    }
+
+    if (
+      !options.prefersReducedMotion ||
+      options.prefersReducedMotion === 'auto'
+    ) {
+      delete newSettings.prefersReducedMotion;
+    } else {
+      newSettings.prefersReducedMotion = options.prefersReducedMotion;
+    }
+
+    await this.#emulateMediaFeatures(newSettings);
 
     if (!options.viewport) {
       delete newSettings.viewport;
@@ -1164,21 +1268,21 @@ export class McpPage implements ContextPage {
     await page.setViewport(newSettings.viewport ?? null);
   }
 
-  updateTimeouts() {
+  updateTimeouts(): void {
     if (!this.#pptrPage) {
       return;
     }
     // For waiters 5sec timeout should be sufficient.
     // Increased in case we throttle the CPU
     const cpuMultiplier = this.cpuThrottlingRate;
-    this.#pptrPage.setDefaultTimeout(DEFAULT_TIMEOUT * cpuMultiplier);
+    this.pptrPage.setDefaultTimeout(DEFAULT_TIMEOUT * cpuMultiplier);
     // 10sec should be enough for the load event to be emitted during
     // navigations.
     // Increased in case we throttle the network requests or the CPU
     const networkMultiplier = getNetworkMultiplierFromString(
       this.networkConditions,
     );
-    this.#pptrPage.setDefaultNavigationTimeout(
+    this.pptrPage.setDefaultNavigationTimeout(
       this.#navigationTimeout * networkMultiplier * cpuMultiplier,
     );
   }
@@ -1205,7 +1309,7 @@ export class McpPage implements ContextPage {
   /**
    * We need to ignore favicon request as they make our test flaky
    */
-  async setUpNetworkCollectorForTesting() {
+  async setUpNetworkCollectorForTesting(): Promise<void> {
     this.networkCollector.dispose();
     this.networkCollector = new NetworkCollector(
       this.pptrPage,
