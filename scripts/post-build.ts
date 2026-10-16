@@ -7,10 +7,6 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
-import tsConfig from '../tsconfig.json' with {type: 'json'};
-
-import {sed} from './sed.ts';
-
 const BUILD_DIR = path.join(process.cwd(), 'build');
 
 /**
@@ -22,100 +18,40 @@ function writeFile(filePath: string, content: string): void {
   fs.writeFileSync(filePath, content, 'utf-8');
 }
 
-/**
- * Ensures that licenses for third party files we use gets copied into the build/ dir.
- */
-function copyThirdPartyLicenseFiles() {
-  const thirdPartyDirectories = tsConfig.include.filter(location => {
-    return location.includes(
-      'node_modules/chrome-devtools-frontend/front_end/third_party',
-    );
-  });
-
-  for (const thirdPartyDir of thirdPartyDirectories) {
-    const fullPath = path.join(process.cwd(), thirdPartyDir);
-    const licenseFile = path.join(fullPath, 'LICENSE');
-    if (!fs.existsSync(licenseFile)) {
-      console.error('No LICENSE for', path.basename(thirdPartyDir));
-    }
-
-    const destinationDir = path.join(BUILD_DIR, thirdPartyDir);
-    const destinationFile = path.join(destinationDir, 'LICENSE');
-    fs.copyFileSync(licenseFile, destinationFile);
-  }
-}
-
 function main(): void {
+  const devtoolsTs = path.join(
+    process.cwd(),
+    'src',
+    'third_party',
+    'devtools.ts',
+  );
+  if (fs.existsSync(devtoolsTs)) {
+    fs.unlinkSync(devtoolsTs);
+  }
   const devtoolsThirdPartyPath =
-    'node_modules/chrome-devtools-frontend/front_end/third_party';
+    'third_party/devtools-frontend/front_end/third_party';
   const devtoolsFrontEndCorePath =
-    'node_modules/chrome-devtools-frontend/front_end/core';
+    'third_party/devtools-frontend/front_end/core';
 
   // Create i18n mock
   const i18nDir = path.join(BUILD_DIR, devtoolsFrontEndCorePath, 'i18n');
   fs.mkdirSync(i18nDir, {recursive: true});
-  const i18nFile = path.join(i18nDir, 'i18n.js');
-  const i18nContent = `
-export const i18n = {
-  registerUIStrings: () => {},
-  getLocalizedString: (_, str) => {
-    // So that the string passed in gets output verbatim.
-    return str;
-  },
-  lockedLazyString: () => {},
-  getLazilyComputedLocalizedString: () => {},
-};
+  const localesFile = path.join(i18nDir, 'locales.js');
+  const localesContent = `
+export const LOCALES = [
+  'en-US',
+];
 
-// TODO(jacktfranklin): once the DocumentLatency insight does not depend on
-// this method, we can remove this stub.
-export const TimeUtilities = {
-  millisToString(x) {
-    const separator = '\xA0';
-    const formatter = new Intl.NumberFormat('en-US', {
-      style: 'unit',
-      unitDisplay: 'narrow',
-      minimumFractionDigits: 0,
-      maximumFractionDigits: 1,
-      unit: 'millisecond',
-    });
+export const BUNDLED_LOCALES = [
+  'en-US',
+];
 
-    const parts = formatter.formatToParts(x);
-    for (const part of parts) {
-      if (part.type === 'literal') {
-        if (part.value === ' ') {
-          part.value = separator;
-        }
-      }
-    }
+export const DEFAULT_LOCALE = 'en-US';
 
-    return parts.map(part => part.value).join('');
-  }
-};
+export const REMOTE_FETCH_PATTERN = '@HOST@/remote/serve_file/@VERSION@/core/i18n/locales/@LOCALE@.json';
 
-// TODO(jacktfranklin): once the ImageDelivery insight does not depend on this method, we can remove this stub.
-export const ByteUtilities = {
-  bytesToString(x) {
-    const separator = '\xA0';
-    const formatter = new Intl.NumberFormat('en-US', {
-      style: 'unit',
-      unit: 'kilobyte',
-      unitDisplay: 'narrow',
-      minimumFractionDigits: 1,
-      maximumFractionDigits: 1,
-    });
-    const parts = formatter.formatToParts(x / 1000);
-    for (const part of parts) {
-      if (part.type === 'literal') {
-        if (part.value === ' ') {
-          part.value = separator;
-        }
-      }
-    }
-
-    return parts.map(part => part.value).join('');
-  }
-};`;
-  writeFile(i18nFile, i18nContent);
+export const LOCAL_FETCH_PATTERN = './locales/@LOCALE@.json';`;
+  writeFile(localesFile, localesContent);
 
   // Create codemirror.next mock.
   const codeMirrorDir = path.join(
@@ -125,8 +61,40 @@ export const ByteUtilities = {
   );
   fs.mkdirSync(codeMirrorDir, {recursive: true});
   const codeMirrorFile = path.join(codeMirrorDir, 'codemirror.next.js');
-  const codeMirrorContent = `export default {}`;
+  const codeMirrorContent = `
+export default {};
+export const cssStreamParser = () => Promise.resolve({ startState: () => ({}) });
+export class StringStream { constructor() {} }
+export const css = { cssLanguage: { parser: { parse: () => ({ topNode: { getChild: () => null } }) } } };
+`;
   writeFile(codeMirrorFile, codeMirrorContent);
+
+  // Create skills mocks
+  const skillsDir = path.join(
+    BUILD_DIR,
+    'third_party',
+    'devtools-frontend',
+    'front_end',
+    'models',
+    'ai_assistance',
+    'skills',
+  );
+  fs.mkdirSync(skillsDir, {recursive: true});
+  const skillMockContent = `
+export const skill = {
+  name: '',
+  description: '',
+  tools: [],
+  systemPrompt: '',
+};
+export default skill;
+`;
+  writeFile(path.join(skillsDir, 'lighthouse.skill.js'), skillMockContent);
+  writeFile(path.join(skillsDir, 'network.skill.js'), skillMockContent);
+  writeFile(path.join(skillsDir, 'performance.skill.js'), skillMockContent);
+  writeFile(path.join(skillsDir, 'sources.skill.js'), skillMockContent);
+  writeFile(path.join(skillsDir, 'storage.skill.js'), skillMockContent);
+  writeFile(path.join(skillsDir, 'styling.skill.js'), skillMockContent);
 
   // Create root mock
   const rootDir = path.join(BUILD_DIR, devtoolsFrontEndCorePath, 'root');
@@ -134,41 +102,96 @@ export const ByteUtilities = {
   const runtimeFile = path.join(rootDir, 'Runtime.js');
   const runtimeContent = `
 export function getChromeVersion() { return ''; };
+export function getRemoteBase() { return null; };
 export const hostConfig = {};
+export const GenAiEnterprisePolicyValue = {
+  ALLOW: 0,
+  ALLOW_WITHOUT_LOGGING: 1,
+  DISABLE: 2,
+};
+export const HostConfigFreestylerExecutionMode = {
+  ALL_SCRIPTS: 'ALL_SCRIPTS',
+  SIDE_EFFECT_FREE_SCRIPTS_ONLY: 'SIDE_EFFECT_FREE_SCRIPTS_ONLY',
+  NO_SCRIPTS: 'NO_SCRIPTS',
+};
+export const GdpProfilesEnterprisePolicyValue = {
+  ENABLED: 0,
+  ENABLED_WITHOUT_BADGES: 1,
+  DISABLED: 2,
+};
+export const Runtime = {
+  isDescriptorEnabled: () => true,
+  queryParam: () => null,
+}
+export const experiments = {
+  isEnabled: () => false,
+}
+export const ExperimentName = {
+  ALL: '*',
+  CAPTURE_NODE_CREATION_STACKS: 'capture-node-creation-stacks',
+  LIVE_HEAP_PROFILE: 'live-heap-profile',
+  PROTOCOL_MONITOR: 'protocol-monitor',
+  SAMPLING_HEAP_PROFILER_TIMELINE: 'sampling-heap-profiler-timeline',
+  SHOW_OPTION_TO_EXPOSE_INTERNALS_IN_HEAP_SNAPSHOT: 'show-option-to-expose-internals-in-heap-snapshot',
+  TIMELINE_INVALIDATION_TRACKING: 'timeline-invalidation-tracking',
+  TIMELINE_SHOW_ALL_EVENTS: 'timeline-show-all-events',
+  TIMELINE_V8_RUNTIME_CALL_STATS: 'timeline-v8-runtime-call-stats',
+  APCA: 'apca',
+  FONT_EDITOR: 'font-editor',
+  FULL_ACCESSIBILITY_TREE: 'full-accessibility-tree',
+  CONTRAST_ISSUES: 'contrast-issues',
+  EXPERIMENTAL_COOKIE_FEATURES: 'experimental-cookie-features',
+  INSTRUMENTATION_BREAKPOINTS: 'instrumentation-breakpoints',
+  AUTHORED_DEPLOYED_GROUPING: 'authored-deployed-grouping',
+  JUST_MY_CODE: 'just-my-code',
+  USE_SOURCE_MAP_SCOPES: 'use-source-map-scopes',
+  TIMELINE_SHOW_POST_MESSAGE_EVENTS: 'timeline-show-postmessage-events',
+  TIMELINE_DEBUG_MODE: 'timeline-debug-mode',
+}
   `;
   writeFile(runtimeFile, runtimeContent);
 
-  // Update protocol_client to remove:
-  // 1. self.Protocol assignment
-  // 2. Call to register backend commands.
-  const protocolClientDir = path.join(
+  // Copy missing CodeMirror .mjs files that tsc ignores due to .d.mts renames
+  const codemirrorDir = path.join(
     BUILD_DIR,
-    devtoolsFrontEndCorePath,
-    'protocol_client',
+    devtoolsThirdPartyPath,
+    'codemirror',
   );
-  const clientFile = path.join(protocolClientDir, 'protocol_client.js');
-  const globalAssignment = /self\.Protocol = self\.Protocol \|\| \{\};/;
-  const registerCommands =
-    /InspectorBackendCommands\.registerCommands\(InspectorBackend\.inspectorBackend\);/;
-  sed(clientFile, globalAssignment, '');
-  sed(clientFile, registerCommands, '');
-
-  const devtoolsLicensePath = path.join(
-    'node_modules',
-    'chrome-devtools-frontend',
-    'LICENSE',
-  );
-  const devtoolsLicenseFileSource = path.join(
+  const codemirrorSrcDir = path.join(
     process.cwd(),
-    devtoolsLicensePath,
+    'third_party',
+    'devtools-frontend',
+    'front_end',
+    'third_party',
+    'codemirror',
   );
-  const devtoolsLicenseFileDestination = path.join(
-    BUILD_DIR,
-    devtoolsLicensePath,
-  );
-  fs.copyFileSync(devtoolsLicenseFileSource, devtoolsLicenseFileDestination);
+  const filesToCopy = [
+    'package/addon/runmode/runmode-standalone.mjs',
+    'package/mode/css/css.mjs',
+    'package/mode/javascript/javascript.mjs',
+    'package/mode/xml/xml.mjs',
+  ];
+  for (const file of filesToCopy) {
+    const src = path.join(codemirrorSrcDir, file);
+    const dest = path.join(codemirrorDir, file);
+    fs.mkdirSync(path.dirname(dest), {recursive: true});
+    fs.copyFileSync(src, dest);
+  }
 
-  copyThirdPartyLicenseFiles();
+  copyDevToolsDescriptionFiles();
+}
+
+function copyDevToolsDescriptionFiles(): void {
+  const devtoolsIssuesDescriptionPath =
+    'third_party/devtools-frontend/front_end/models/issues_manager/descriptions';
+  const sourceDir = path.join(process.cwd(), devtoolsIssuesDescriptionPath);
+  const destDir = path.join(
+    BUILD_DIR,
+    'src',
+    'third_party',
+    'issue-descriptions',
+  );
+  fs.cpSync(sourceDir, destDir, {recursive: true});
 }
 
 main();

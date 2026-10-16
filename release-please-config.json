@@ -4,8 +4,8 @@
     {"type": "fix", "section": "🛠️ Fixes", "hidden": false},
     {"type": "docs", "section": "📄 Documentation", "hidden": false},
 
-    {"type": "perf", "section": "♻️ Chores", "hidden": false},
-    {"type": "refactor", "section": "♻️ Chores", "hidden": false},
+    {"type": "perf", "section": "⚡ Performance", "hidden": false},
+    {"type": "refactor", "section": "🏗️ Refactor", "hidden": false},
     {"type": "chore", "section": "♻️ Chores", "hidden": true},
     {"type": "test", "section": "♻️ Chores", "hidden": true},
 
@@ -18,7 +18,7 @@
       "extra-files": [
         {
           "type": "generic",
-          "path": "src/main.ts"
+          "path": "src/version.ts"
         },
         {
           "type": "json",
@@ -29,6 +29,61 @@
           "type": "json",
           "path": "server.json",
           "jsonpath": "packages[0].version"
+        },
+        {
+          "type": "json",
+          "path": ".claude-plugin/marketplace.json",
+          "jsonpath": "version"
+        },
+        {
+          "type": "json",
+          "path": ".claude-plugin/plugin.json",
+          "jsonpath": "version"
+        },
+        {
+          "type": "json",
+          "path": ".claude-plugin/plugin.json",
+          "jsonpath": "mcpServers['chrome-devtools'].args[0]"
+        },
+        {
+          "type": "json",
+          "path": ".cursor-plugin/plugin.json",
+          "jsonpath": "version"
+        },
+        {
+          "type": "json",
+          "path": ".cursor-plugin/plugin.json",
+          "jsonpath": "mcpServers['chrome-devtools'].args[0]"
+        },
+        {
+          "type": "json",
+          "path": "gemini-extension.json",
+          "jsonpath": "version"
+        },
+        {
+          "type": "json",
+          "path": "gemini-extension.json",
+          "jsonpath": "mcpServers['chrome-devtools'].args[0]"
+        },
+        {
+          "type": "json",
+          "path": ".github/plugin/plugin.json",
+          "jsonpath": "version"
+        },
+        {
+          "type": "json",
+          "path": ".github/plugin/plugin.json",
+          "jsonpath": "mcpServers['chrome-devtools'].args[0]"
+        },
+        {
+          "type": "json",
+          "path": "plugin.json",
+          "jsonpath": "version"
+        },
+        {
+          "type": "json",
+          "path": "mcp.json",
+          "jsonpath": "mcpServers['chrome-devtools'].args[2]"
         }
       ]
     }

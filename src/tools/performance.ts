@@ -4,40 +4,58 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import {logger} from '../logger.js';
-import {zod} from '../third_party/index.js';
-import type {Page} from '../third_party/index.js';
-import type {InsightName} from '../trace-processing/parse.js';
+import zlib from 'node:zlib';
+
+import {zod, DevTools} from '../third_party/index.js';
+import type {InsightName, TraceResult} from '../processors/PerformanceTrace.js';
 import {
-  getInsightOutput,
-  getTraceSummary,
   parseRawTraceBuffer,
   traceResultIsSuccess,
-} from '../trace-processing/parse.js';
+} from '../processors/PerformanceTrace.js';
+import {logger} from '../utils/logger.js';
 
 import {ToolCategory} from './categories.js';
-import type {Context, Response} from './ToolDefinition.js';
-import {defineTool} from './ToolDefinition.js';
+import type {Context, Response, ContextPage} from './ToolDefinition.js';
+import {definePageTool} from './ToolDefinition.js';
 
-export const startTrace = defineTool({
+const filePathSchema = zod
+  .string()
+  .optional()
+  .describe(
+    'The absolute file path, or a file path relative to the current working directory, to save the raw trace data. For example, trace.json.gz (compressed) or trace.json (uncompressed).',
+  );
+
+export const startTrace = definePageTool(() => ({
   name: 'performance_start_trace',
-  description:
-    'Starts a performance trace recording on the selected page. This can be used to look for performance problems and insights to improve the performance of the page. It will also report Core Web Vital (CWV) scores for the page.',
+  description: `Start a performance trace on the target webpage. Use to find frontend performance issues, Core Web Vitals (LCP, INP, CLS), and improve page load speed.`,
   annotations: {
     category: ToolCategory.PERFORMANCE,
-    readOnlyHint: true,
+    readOnlyHint: false,
   },
   schema: {
     reload: zod
       .boolean()
+      .default(true)
       .describe(
-        'Determines if, once tracing has started, the page should be automatically reloaded.',
+        'Determines if, once tracing has started, the target page should be automatically reloaded. Navigate the page to the right URL using the navigate_page tool BEFORE starting the trace if reload or autoStop is set to true.',
       ),
     autoStop: zod
       .boolean()
+      .default(true)
       .describe(
         'Determines if the trace recording should be automatically stopped.',
       ),
+    ignoreCache: zod
+      .boolean()
+      .optional()
+      .describe(
+        'Whether to bypass the HTTP cache when reloading the page, to measure a cold page load. Only applies if reload is true.',
+      ),
+    filePath: filePathSchema,
+  },
+  blockedByDialog: true,
+  verifyFilesSchema: {
+    filePath: true,
   },
   handler: async (request, response, context) => {
     if (context.isRunningPerformanceTrace()) {
@@ -48,91 +66,135 @@ export const startTrace = defineTool({
     }
     context.setIsRunningPerformanceTrace(true);
 
-    const page = context.getSelectedPage();
-    const pageUrlForTracing = page.url();
+    const page = request.page;
+    const pageUrlForTracing = page.pptrPage.url();
 
-    if (request.params.reload) {
-      // Before starting the recording, navigate to about:blank to clear out any state.
-      await page.goto('about:blank', {
-        waitUntil: ['networkidle0'],
+    try {
+      if (request.params.reload) {
+        // Before starting the recording, navigate to about:blank to clear out any state.
+        // We use `load` because `networkidle0` is known to be flaky for about:blank in Puppeteer.
+        await page.pptrPage.goto('about:blank', {
+          waitUntil: 'load',
+        });
+      }
+
+      const categories = [
+        '-*',
+        ...DevTools.TracingDefaultCategories,
+        // These categories are optional in DevTools, but enabled by default in the DevTools UI, so we enable them here too.
+        ...DevTools.TracingOptionalCategories.JsSampling,
+        ...DevTools.TracingOptionalCategories.Screenshot,
+      ];
+      await page.pptrPage.tracing.start({
+        categories,
+        bufferSize: 1200 * 1000,
       });
-    }
 
-    // Keep in sync with the categories arrays in:
-    // https://source.chromium.org/chromium/chromium/src/+/main:third_party/devtools-frontend/src/front_end/panels/timeline/TimelineController.ts
-    // https://github.com/GoogleChrome/lighthouse/blob/master/lighthouse-core/gather/gatherers/trace.js
-    const categories = [
-      '-*',
-      'blink.console',
-      'blink.user_timing',
-      'devtools.timeline',
-      'disabled-by-default-devtools.screenshot',
-      'disabled-by-default-devtools.timeline',
-      'disabled-by-default-devtools.timeline.invalidationTracking',
-      'disabled-by-default-devtools.timeline.frame',
-      'disabled-by-default-devtools.timeline.stack',
-      'disabled-by-default-v8.cpu_profiler',
-      'disabled-by-default-v8.cpu_profiler.hires',
-      'latencyInfo',
-      'loading',
-      'disabled-by-default-lighthouse',
-      'v8.execute',
-      'v8',
-    ];
-    await page.tracing.start({
-      categories,
-    });
+      if (request.params.reload) {
+        const ignoreCache = request.params.ignoreCache ?? false;
+        if (ignoreCache) {
+          // Disable the HTTP cache so that the main document and all
+          // subresources are fetched from the network, like a hard reload.
+          await page.pptrPage.setCacheEnabled(false);
+        }
+        try {
+          await page.pptrPage.goto(pageUrlForTracing, {
+            waitUntil: ['load'],
+          });
+        } finally {
+          if (ignoreCache) {
+            await page.pptrPage.setCacheEnabled(true);
+          }
+        }
+      }
 
-    if (request.params.reload) {
-      await page.goto(pageUrlForTracing, {
-        waitUntil: ['load'],
-      });
-    }
-
-    if (request.params.autoStop) {
-      await new Promise(resolve => setTimeout(resolve, 5_000));
-      await stopTracingAndAppendOutput(page, response, context);
-    } else {
-      response.appendResponseLine(
-        `The performance trace is being recorded. Use performance_stop_trace to stop it.`,
-      );
+      if (request.params.autoStop) {
+        await new Promise(resolve => setTimeout(resolve, 5_000));
+        await stopTracingAndAppendOutput(
+          page,
+          response,
+          context,
+          request.params.filePath,
+        );
+      } else {
+        response.appendResponseLine(
+          `The performance trace is being recorded. Use performance_stop_trace to stop it.`,
+        );
+      }
+    } catch (error) {
+      // If a setup step (navigation, tracing.start) throws before
+      // stopTracingAndAppendOutput runs, the running flag would otherwise stay
+      // stuck `true` for the rest of the session, blocking all future traces.
+      // Unwind here: stop tracing if it was started and clear the flag. When
+      // autoStop already ran stopTracingAndAppendOutput the flag is already
+      // false and this is a no-op.
+      if (context.isRunningPerformanceTrace()) {
+        try {
+          await page.pptrPage.tracing.stop();
+        } catch {
+          // Tracing may not have started yet; ignore.
+        }
+        context.setIsRunningPerformanceTrace(false);
+      }
+      throw error;
     }
   },
-});
+}));
 
-export const stopTrace = defineTool({
+export const stopTrace = definePageTool(() => ({
   name: 'performance_stop_trace',
   description:
-    'Stops the active performance trace recording on the selected page.',
+    'Stop the active performance trace recording on the target webpage.',
   annotations: {
     category: ToolCategory.PERFORMANCE,
-    readOnlyHint: true,
+    readOnlyHint: false,
   },
-  schema: {},
-  handler: async (_request, response, context) => {
+  schema: {
+    filePath: filePathSchema,
+  },
+  blockedByDialog: true,
+  verifyFilesSchema: {
+    filePath: true,
+  },
+  handler: async (request, response, context) => {
     if (!context.isRunningPerformanceTrace()) {
+      response.appendResponseLine(
+        'Error: no active performance trace recording to stop.',
+      );
       return;
     }
-    const page = context.getSelectedPage();
-    await stopTracingAndAppendOutput(page, response, context);
+    const page = request.page;
+    await stopTracingAndAppendOutput(
+      page,
+      response,
+      context,
+      request.params.filePath,
+    );
   },
-});
+}));
 
-export const analyzeInsight = defineTool({
+export const analyzeInsight = definePageTool(() => ({
   name: 'performance_analyze_insight',
   description:
-    'Provides more detailed information on a specific Performance Insight that was highlighted in the results of a trace recording.',
+    'Provides more detailed information on a specific Performance Insight of an insight set that was highlighted in the results of a trace recording.',
   annotations: {
     category: ToolCategory.PERFORMANCE,
     readOnlyHint: true,
   },
   schema: {
+    insightSetId: zod
+      .string()
+      .describe(
+        'The id for the specific insight set. Only use the ids given in the "Available insight sets" list.',
+      ),
     insightName: zod
       .string()
       .describe(
         'The name of the Insight you want more information on. For example: "DocumentLatency" or "LCPBreakdown"',
       ),
   },
+  blockedByDialog: false,
+  verifyFilesSchema: {},
   handler: async (request, response, context) => {
     const lastRecording = context.recordedTraces().at(-1);
     if (!lastRecording) {
@@ -142,46 +204,101 @@ export const analyzeInsight = defineTool({
       return;
     }
 
-    const insightOutput = getInsightOutput(
+    response.attachTraceInsight(
       lastRecording,
+      request.params.insightSetId,
       request.params.insightName as InsightName,
     );
-    if ('error' in insightOutput) {
-      response.appendResponseLine(insightOutput.error);
-      return;
-    }
-
-    response.appendResponseLine(insightOutput.output);
   },
-});
+}));
 
 async function stopTracingAndAppendOutput(
-  page: Page,
+  page: ContextPage,
   response: Response,
   context: Context,
+  filePath?: string,
 ): Promise<void> {
   try {
-    const traceEventsBuffer = await page.tracing.stop();
-    const result = await parseRawTraceBuffer(traceEventsBuffer);
+    const traceEventsBuffer = await page.pptrPage.tracing.stop();
+    if (filePath && traceEventsBuffer) {
+      let dataToWrite: Uint8Array = traceEventsBuffer;
+      if (filePath.endsWith('.gz')) {
+        dataToWrite = await new Promise((resolve, reject) => {
+          zlib.gzip(traceEventsBuffer, (error, result) => {
+            if (error) {
+              reject(error);
+            } else {
+              resolve(result);
+            }
+          });
+        });
+      }
+      const file = await context.saveFile(
+        dataToWrite,
+        filePath,
+        filePath.endsWith('.gz') ? '.gz' : '.json',
+      );
+      response.appendResponseLine(
+        `The raw trace data was saved to ${file.filename}.`,
+      );
+    }
+    const result = await parseRawTraceBuffer(traceEventsBuffer, {
+      cpuThrottling: page.cpuThrottlingRate,
+      networkThrottling: page.networkConditions ?? undefined,
+    });
     response.appendResponseLine('The performance trace has been stopped.');
     if (traceResultIsSuccess(result)) {
+      if (context.isCruxEnabled()) {
+        await populateCruxData(result);
+      }
       context.storeTraceRecording(result);
-      const traceSummaryText = getTraceSummary(result);
-      response.appendResponseLine(traceSummaryText);
+      response.attachTraceSummary(result);
     } else {
-      response.appendResponseLine(
-        'There was an unexpected error parsing the trace:',
+      throw new Error(
+        `There was an unexpected error parsing the trace: ${result.error}`,
       );
-      response.appendResponseLine(result.error);
     }
-  } catch (e) {
-    const errorText = e instanceof Error ? e.message : JSON.stringify(e);
-    logger(`Error stopping performance trace: ${errorText}`);
-    response.appendResponseLine(
-      'An error occurred generating the response for this trace:',
-    );
-    response.appendResponseLine(errorText);
   } finally {
     context.setIsRunningPerformanceTrace(false);
   }
+}
+
+/** We tell CrUXManager to fetch data so it's available when DevTools.PerformanceTraceFormatter is invoked */
+async function populateCruxData(result: TraceResult): Promise<void> {
+  logger?.('populateCruxData called');
+  const cruxManager = DevTools.CrUXManager.CrUXManager.instance();
+  // go/jtfbx. Yes, we're aware this API key is public. ;)
+  cruxManager.setEndpointForTesting(
+    'https://chromeuxreport.googleapis.com/v1/records:queryRecord?key=AIzaSyBn5gimNjhiEyA_euicSKko6IlD3HdgUfk',
+  );
+  const cruxSetting =
+    DevTools.Common.Settings.Settings.instance().createSetting('field-data', {
+      enabled: true,
+    });
+  cruxSetting.set({enabled: true});
+
+  // Gather URLs to fetch CrUX data for
+  const urls = [...(result.parsedTrace.insights?.values() ?? [])].map(c =>
+    c.url.toString(),
+  );
+  urls.push(result.parsedTrace.data.Meta.mainFrameURL);
+  const urlSet = new Set(urls);
+
+  if (urlSet.size === 0) {
+    logger?.('No URLs found for CrUX data');
+    return;
+  }
+
+  logger?.(
+    `Fetching CrUX data for ${urlSet.size} URLs: ${Array.from(urlSet).join(', ')}`,
+  );
+  const cruxData = await Promise.all(
+    Array.from(urlSet).map(async url => {
+      const data = await cruxManager.getFieldDataForPage(url);
+      logger?.(`CrUX data for ${url}: ${data ? 'found' : 'not found'}`);
+      return data;
+    }),
+  );
+
+  result.parsedTrace.metadata.cruxFieldData = cruxData;
 }

@@ -3,6 +3,7 @@
  * Copyright 2025 Google LLC
  * SPDX-License-Identifier: Apache-2.0
  */
+
 import http, {
   type IncomingMessage,
   type Server,
@@ -12,7 +13,7 @@ import {before, after, afterEach} from 'node:test';
 
 import {html} from './utils.js';
 
-class TestServer {
+export class TestServer {
   #port: number;
   #server: Server;
 
@@ -37,7 +38,7 @@ class TestServer {
   }
 
   get baseUrl(): string {
-    return `http://localhost:${this.#port}`;
+    return `http://127.0.0.1:${this.#port}`;
   }
 
   getRoute(path: string) {
@@ -86,14 +87,37 @@ class TestServer {
     this.#routes = {};
   }
 
-  start(): Promise<void> {
-    return new Promise(res => {
-      this.#server.listen(this.#port, res);
-    });
+  async start(): Promise<void> {
+    let retries = 5;
+    while (retries > 0) {
+      try {
+        await new Promise<void>((res, rej) => {
+          this.#server.once('error', rej);
+          this.#server.listen(this.#port, () => {
+            this.#server.off('error', rej);
+            res();
+          });
+        });
+        return;
+      } catch (err) {
+        if (
+          err instanceof Error &&
+          'code' in err &&
+          err.code === 'EADDRINUSE'
+        ) {
+          retries--;
+          this.#port = TestServer.randomPort();
+        } else {
+          throw err;
+        }
+      }
+    }
+    throw new Error('Failed to bind to a port after 5 retries');
   }
 
   stop(): Promise<void> {
     return new Promise((res, rej) => {
+      this.#server.closeAllConnections();
       this.#server.close(err => {
         if (err) {
           rej(err);

@@ -24,11 +24,12 @@ export default {
     schema: [],
     messages: {
       licenseRule: 'Add license header.',
+      emptyLine: 'Add empty line after license header.',
     },
   },
   defaultOptions: [],
   create(context) {
-    const sourceCode = context.getSourceCode();
+    const sourceCode = context.sourceCode;
     const comments = sourceCode.getAllComments();
     let insertAfter = [0, 0];
     let header = null;
@@ -54,7 +55,7 @@ export default {
 
     return {
       Program(node) {
-        if (context.getFilename().endsWith('.json')) {
+        if (context.filename.endsWith('.json')) {
           return;
         }
 
@@ -64,13 +65,29 @@ export default {
             header.value.includes('License') ||
             header.value.includes('Copyright'))
         ) {
+          const nextToken = sourceCode.getTokenAfter(header, {
+            includeComments: true,
+          });
+          if (
+            nextToken &&
+            nextToken.loc.start.line === header.loc.end.line + 1
+          ) {
+            context.report({
+              node,
+              loc: header.loc,
+              messageId: 'emptyLine',
+              fix(fixer) {
+                return fixer.insertTextAfter(header, '\n');
+              },
+            });
+          }
           return;
         }
 
         // Add header license
         if (!header || !header.value.includes('@license')) {
           context.report({
-            node: node,
+            node,
             messageId: 'licenseRule',
             fix(fixer) {
               return fixer.insertTextAfterRange(insertAfter, licenseHeader);

@@ -2,86 +2,131 @@
  * @license
  * Copyright 2025 Google LLC
  * SPDX-License-Identifier: Apache-2.0
+ *
  */
 
 import {zod, PredefinedNetworkConditions} from '../third_party/index.js';
+import {
+  FORCED_COLORS_VALUES,
+  PREFERS_CONTRAST_VALUES,
+  PREFERS_REDUCED_MOTION_VALUES,
+} from '../types.js';
 
 import {ToolCategory} from './categories.js';
-import {defineTool} from './ToolDefinition.js';
+import {
+  definePageTool,
+  geolocationTransform,
+  viewportTransform,
+} from './ToolDefinition.js';
+
+function headerStringTransform(
+  value: string | undefined,
+): Record<string, string> | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value === '') {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(value);
+    if (
+      typeof parsed !== 'object' ||
+      parsed === null ||
+      Array.isArray(parsed)
+    ) {
+      throw new Error('Headers must be a JSON object');
+    }
+    return parsed as Record<string, string>;
+  } catch (error) {
+    throw new Error(
+      `Invalid JSON for headers: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
 
 const throttlingOptions: [string, ...string[]] = [
-  'No emulation',
   'Offline',
   ...Object.keys(PredefinedNetworkConditions),
 ];
 
-export const emulateNetwork = defineTool({
-  name: 'emulate_network',
-  description: `Emulates network conditions such as throttling or offline mode on the selected page.`,
+export const emulate = definePageTool(() => ({
+  name: 'emulate',
+  description: `Emulates various features on the target page. Each call replaces all emulation settings (except extraHttpHeaders), so pass all desired settings in a single call.`,
   annotations: {
     category: ToolCategory.EMULATION,
     readOnlyHint: false,
   },
   schema: {
-    throttlingOption: zod
+    networkConditions: zod
       .enum(throttlingOptions)
-      .describe(
-        `The network throttling option to emulate. Available throttling options are: ${throttlingOptions.join(', ')}. Set to "No emulation" to disable. Set to "Offline" to simulate offline network conditions.`,
-      ),
-  },
-  handler: async (request, _response, context) => {
-    const page = context.getSelectedPage();
-    const conditions = request.params.throttlingOption;
-
-    if (conditions === 'No emulation') {
-      await page.emulateNetworkConditions(null);
-      context.setNetworkConditions(null);
-      return;
-    }
-
-    if (conditions === 'Offline') {
-      await page.emulateNetworkConditions({
-        offline: true,
-        download: 0,
-        upload: 0,
-        latency: 0,
-      });
-      context.setNetworkConditions('Offline');
-      return;
-    }
-
-    if (conditions in PredefinedNetworkConditions) {
-      const networkCondition =
-        PredefinedNetworkConditions[
-          conditions as keyof typeof PredefinedNetworkConditions
-        ];
-      await page.emulateNetworkConditions(networkCondition);
-      context.setNetworkConditions(conditions);
-    }
-  },
-});
-
-export const emulateCpu = defineTool({
-  name: 'emulate_cpu',
-  description: `Emulates CPU throttling by slowing down the selected page's execution.`,
-  annotations: {
-    category: ToolCategory.EMULATION,
-    readOnlyHint: false,
-  },
-  schema: {
-    throttlingRate: zod
+      .optional()
+      .describe(`Throttle network. Omit to disable throttling.`),
+    cpuThrottlingRate: zod
       .number()
       .min(1)
       .max(20)
+      .optional()
       .describe(
-        'The CPU throttling rate representing the slowdown factor 1-20x. Set the rate to 1 to disable throttling',
+        'Represents the CPU slowdown factor. Omit or set the rate to 1 to disable throttling',
+      ),
+    geolocation: zod
+      .string()
+      .transform(geolocationTransform)
+      .optional()
+      .describe(
+        'Geolocation (`<latitude>,<longitude>`) to emulate. Latitude between -90 and 90. Longitude between -180 and 180. Omit to clear the geolocation override.',
+      ),
+    userAgent: zod
+      .string()
+      .optional()
+      .describe(
+        'User agent to emulate. Omit or set to empty string to clear the user agent override.',
+      ),
+    colorScheme: zod
+      .enum(['dark', 'light', 'auto'])
+      .optional()
+      .describe(
+        'Emulate the dark or the light mode. Omit or set to "auto" to reset to the default.',
+      ),
+    forcedColors: zod
+      .enum([...FORCED_COLORS_VALUES, 'auto'])
+      .optional()
+      .describe(
+        'Emulate the `forced-colors` CSS media feature. Omit or set to "auto" to reset to the default.',
+      ),
+    prefersContrast: zod
+      .enum([...PREFERS_CONTRAST_VALUES, 'auto'])
+      .optional()
+      .describe(
+        'Emulate the `prefers-contrast` CSS media feature. Omit or set to "auto" to reset to the default.',
+      ),
+    prefersReducedMotion: zod
+      .enum([...PREFERS_REDUCED_MOTION_VALUES, 'auto'])
+      .optional()
+      .describe(
+        'Emulate the `prefers-reduced-motion` CSS media feature. Omit or set to "auto" to reset to the default.',
+      ),
+    viewport: zod
+      .string()
+      .transform(viewportTransform)
+      .optional()
+      .describe(
+        `Emulate device viewports '<width>x<height>x<devicePixelRatio>[,mobile][,touch][,landscape]'. 'touch' and 'mobile' to emulate mobile devices. 'landscape' to emulate landscape mode. Omit to clear the viewport override.`,
+      ),
+    extraHttpHeaders: zod
+      .string()
+      .transform(headerStringTransform)
+      .optional()
+      .describe(
+        'Extra HTTP headers as a JSON string object, e.g. {"X-Custom": "value", "Authorization": "Bearer token"}. Headers are included into every HTTP request originating from the page and persist across navigations until cleared. Pass an empty string to clear all extra headers.',
       ),
   },
-  handler: async (request, _response, context) => {
-    const page = context.getSelectedPage();
-    const {throttlingRate} = request.params;
-
-    await page.emulateCPUThrottling(throttlingRate);
-    context.setCpuThrottlingRate(throttlingRate);
+  blockedByDialog: true,
+  verifyFilesSchema: {},
+  handler: async (request, response) => {
+    const page = request.page;
+    await page.emulate(request.params);
+    response.appendResponseLine('Emulation configured successfully');
   },
-});
+}));

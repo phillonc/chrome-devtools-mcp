@@ -3,65 +3,235 @@
  * Copyright 2025 Google LLC
  * SPDX-License-Identifier: Apache-2.0
  */
-import logger from 'debug';
+
+import assert from 'node:assert';
+import {spawn, type ChildProcess} from 'node:child_process';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import type {TestContext} from 'node:test';
+
 import type {Browser} from 'puppeteer';
 import puppeteer, {Locator} from 'puppeteer';
+
+import type {CallToolResult} from '../src/third_party/index.js';
 import type {
   Frame,
   HTTPRequest,
   HTTPResponse,
   LaunchOptions,
+  Page,
+  Target,
 } from 'puppeteer-core';
+import sinon from 'sinon';
 
+import type {ParsedArguments} from '../src/config/ConfigParser.js';
+import {stopDaemon} from '../src/daemon/client.js';
+import {isDaemonRunning} from '../src/daemon/utils.js';
 import {McpContext} from '../src/McpContext.js';
 import {McpResponse} from '../src/McpResponse.js';
-import {stableIdSymbol} from '../src/PageCollector.js';
+import {HeapSnapshotManager} from '../src/processors/HeapSnapshotManager.js';
+import {TextSnapshot} from '../src/TextSnapshot.js';
+import {DevTools} from '../src/third_party/index.js';
+import {stableIdSymbol} from '../src/utils/id.js';
+
+import {
+  createMockParsedArguments,
+  createMockPuppeteerPage,
+  mockListener,
+} from './mocks.js';
+
+export function assertNoServiceWorkerReported(targets: Target[], id: string) {
+  const target = targets.find(target => {
+    return target.url().includes(id) && target.type() === 'service_worker';
+  });
+  assert(target === undefined);
+}
+
+export function getTextContent(
+  content: CallToolResult['content'][number],
+): string {
+  if (content.type === 'text') {
+    return content.text;
+  }
+  throw new Error(`Expected text content but got ${content.type}`);
+}
+
+export function getImageContent(content: CallToolResult['content'][number]): {
+  data: string;
+  mimeType: string;
+} {
+  if (content.type === 'image') {
+    return {data: content.data, mimeType: content.mimeType};
+  }
+  throw new Error(`Expected image content but got ${content.type}`);
+}
+
+export function extractExtensionId(response: McpResponse) {
+  const responseLine = response.responseLines[0];
+  assert.ok(responseLine, 'Response should not be empty');
+  const match = responseLine.match(/Extension installed\. Id: (.+)/);
+  const extensionId = match ? match[1] : null;
+  assert.ok(extensionId, 'Response should contain a valid key');
+  return extensionId;
+}
 
 const browsers = new Map<string, Browser>();
+let context: McpContext | undefined;
 
 export async function withBrowser(
-  cb: (response: McpResponse, context: McpContext) => Promise<void>,
-  options: {debug?: boolean; autoOpenDevTools?: boolean} = {},
+  cb: (browser: Browser, page: Page) => Promise<void>,
+  options: {
+    debug?: boolean;
+    autoOpenDevTools?: boolean;
+    executablePath?: string;
+    args?: string[];
+    blockedUrlPattern?: string[];
+    allowedUrlPattern?: string[];
+  } = {},
 ) {
-  const launchOptions: LaunchOptions = {
-    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
-    headless: !options.debug,
-    defaultViewport: null,
-    devtools: options.autoOpenDevTools ?? false,
-    pipe: true,
-    handleDevToolsAsPage: true,
-  };
-  const key = JSON.stringify(launchOptions);
+  let attempt = 1;
+  while (attempt <= 3) {
+    const launchOptions: LaunchOptions = {
+      executablePath:
+        options.executablePath ?? process.env.PUPPETEER_EXECUTABLE_PATH,
+      headless: !options.debug,
+      defaultViewport: null,
+      devtools: options.autoOpenDevTools ?? false,
+      pipe: true,
+      handleDevToolsAsPage: true,
+      args: [...(options.args || []), '--screen-info={3840x2160}'],
+      enableExtensions: true,
+      blocklist: options.blockedUrlPattern,
+      allowlist: options.allowedUrlPattern,
+    };
+    const key = JSON.stringify(launchOptions);
 
-  let browser = browsers.get(key);
-  if (!browser) {
-    browser = await puppeteer.launch(launchOptions);
-    browsers.set(key, browser);
-  }
-  const newPage = await browser.newPage();
-  // Close other pages.
-  await Promise.all(
-    (await browser.pages()).map(async page => {
-      if (page !== newPage) {
-        await page.close();
+    let browser = browsers.get(key);
+    if (!browser) {
+      browser = await puppeteer.launch(launchOptions);
+      browsers.set(key, browser);
+    }
+
+    try {
+      await Promise.race([
+        (async () => {
+          const newPage = await browser.newPage();
+          // Close other pages.
+          await Promise.all(
+            (await browser.pages()).map(async page => {
+              if (page !== newPage) {
+                await page.close();
+              }
+            }),
+          );
+
+          await cb(browser, newPage);
+        })(),
+        new Promise((_, reject) =>
+          setTimeout(
+            () => reject(new Error('withBrowser timeout exceeded')),
+            60000,
+          ),
+        ),
+      ]);
+      return;
+    } catch (error) {
+      browsers.delete(key);
+      try {
+        await Promise.race([
+          browser.close(),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('browser.close timeout')), 2000),
+          ),
+        ]);
+      } catch {
+        browser.process()?.kill('SIGKILL');
       }
-    }),
-  );
-  const response = new McpResponse();
-  const context = await McpContext.from(
-    browser,
-    logger('test'),
-    {
-      experimentalDevToolsDebugging: false,
-    },
-    Locator,
-  );
 
-  await cb(response, context);
+      const isRetryable =
+        error instanceof Error &&
+        (error.message === 'withBrowser timeout exceeded' ||
+          error.message.includes('Navigation timeout') ||
+          error.message.includes("Couldn't fetch install info") ||
+          error.message.includes('closed') ||
+          error.message.includes('crash') ||
+          error.message.includes('hang'));
+
+      if (attempt === 3 || !isRetryable) {
+        throw error;
+      }
+      attempt++;
+      await new Promise(r => setTimeout(r, 1000));
+    }
+  }
+}
+
+export async function withMcpContext(
+  cb: (
+    response: McpResponse,
+    context: McpContext,
+    args: ParsedArguments,
+  ) => Promise<void>,
+  options: {
+    debug?: boolean;
+    autoOpenDevTools?: boolean;
+    performanceCrux?: boolean;
+    sourceMaps?: boolean;
+    executablePath?: string;
+    args?: string[];
+    blockedUrlPattern?: string[];
+    allowedUrlPattern?: string[];
+    allowUnrestrictedPaths?: boolean;
+    navigationTimeout?: number;
+  } = {},
+  args: Partial<ParsedArguments> = {},
+) {
+  await withBrowser(async browser => {
+    TextSnapshot.resetCounter();
+    McpContext.resetPageIdsForTesting();
+    McpContext.resetWorkerIdsForTesting();
+    const parsedArgs = createMockParsedArguments(args);
+    const response = new McpResponse(parsedArgs);
+    const heapSnapshotManager = new HeapSnapshotManager();
+    if (context) {
+      context.dispose();
+    }
+    context = await McpContext.from(
+      browser,
+      undefined,
+      {
+        experimentalDevToolsDebugging: false,
+        performanceCrux: options.performanceCrux ?? true,
+        sourceMaps: options.sourceMaps ?? true,
+        allowlist: options.allowedUrlPattern,
+        blocklist: options.blockedUrlPattern,
+        allowUnrestrictedPaths: options.allowUnrestrictedPaths ?? false,
+        navigationTimeout:
+          options.navigationTimeout ??
+          (process.platform === 'win32' ? 20000 : undefined),
+        categoryExtensions: parsedArgs.categoryExtensions,
+        heapSnapshotManager,
+      },
+      Locator,
+    );
+
+    response.setPage(context.getSelectedMcpPage());
+
+    try {
+      await cb(response, context, parsedArgs);
+    } finally {
+      context.dispose();
+      heapSnapshotManager.dispose();
+      context = undefined;
+    }
+  }, options);
 }
 
 export function getMockRequest(
   options: {
+    url?: string;
     method?: string;
     response?: HTTPResponse;
     failure?: HTTPRequest['failure'];
@@ -72,11 +242,13 @@ export function getMockRequest(
     stableId?: number;
     navigationRequest?: boolean;
     frame?: Frame;
+    redirectChain?: HTTPRequest[];
+    headers?: Record<string, string>;
   } = {},
 ): HTTPRequest {
   return {
     url() {
-      return 'http://example.com';
+      return options.url ?? 'http://example.com';
     },
     method() {
       return options.method ?? 'GET';
@@ -100,12 +272,17 @@ export function getMockRequest(
       return options.resourceType ?? 'document';
     },
     headers(): Record<string, string> {
-      return {
-        'content-size': '10',
-      };
+      return (
+        options.headers ?? {
+          'content-size': '10',
+        }
+      );
     },
     redirectChain(): HTTPRequest[] {
-      return [];
+      // Puppeteer returns a fresh copy on every call (HTTPRequest returns
+      // `this._redirectChain.slice()`); mirror that so formatters can't share
+      // and accidentally mutate the same array across calls.
+      return [...(options.redirectChain ?? [])];
     },
     isNavigationRequest() {
       return options.navigationRequest ?? false;
@@ -120,13 +297,17 @@ export function getMockRequest(
 export function getMockResponse(
   options: {
     status?: number;
+    headers?: Record<string, string>;
   } = {},
 ): HTTPResponse {
   return {
     status() {
       return options.status ?? 200;
     },
-  } as HTTPResponse;
+    headers(): Record<string, string> {
+      return options.headers ?? {};
+    },
+  } as unknown as HTTPResponse;
 }
 
 export function html(
@@ -150,6 +331,34 @@ export function html(
 </html>`;
 }
 
+export function stabilizeStructuredContent(content: unknown): string {
+  if (typeof content === 'string') {
+    return stabilizeResponseOutput(content);
+  }
+  const stabilize = (c: unknown): unknown => {
+    if (typeof c === 'string') {
+      return stabilizeResponseOutput(c);
+    }
+    if (Array.isArray(c)) {
+      return c.map(item => stabilize(item));
+    }
+    if (typeof c === 'object' && c !== null) {
+      const result: Record<string, unknown> = {};
+      for (const [key, value] of Object.entries(c)) {
+        if (key === 'snapshotFilePath' && typeof value === 'string') {
+          result[key] = '<file>';
+        } else {
+          result[key] = stabilize(value);
+        }
+      }
+      return result;
+    }
+    return c;
+  };
+
+  return JSON.stringify(stabilize(content), null, 2);
+}
+
 export function stabilizeResponseOutput(text: unknown) {
   if (typeof text !== 'string') {
     throw new Error('Input must be string');
@@ -158,8 +367,11 @@ export function stabilizeResponseOutput(text: unknown) {
   const dateRegEx = /.{3}, \d{2} .{3} \d{4} \d{2}:\d{2}:\d{2} [A-Z]{3}/g;
   output = output.replaceAll(dateRegEx, '<long date>');
 
-  const localhostRegEx = /http:\/\/localhost:\d{5}\//g;
-  output = output.replaceAll(localhostRegEx, 'http://localhost:<port>/');
+  const localhostRegEx = /localhost:\d{5}/g;
+  output = output.replaceAll(localhostRegEx, 'localhost:<port>');
+
+  const loopbackAddress = /127.0.0.1:\d{5}/g;
+  output = output.replaceAll(loopbackAddress, '127.0.0.1:<port>');
 
   const userAgentRegEx = /user-agent:.*\n/g;
   output = output.replaceAll(userAgentRegEx, 'user-agent:<user-agent>\n');
@@ -173,5 +385,178 @@ export function stabilizeResponseOutput(text: unknown) {
 
   const savedSnapshot = /Saved snapshot to (.*)/g;
   output = output.replaceAll(savedSnapshot, 'Saved snapshot to <file>');
+
+  const acceptLanguageRegEx = /accept-language:.*\n/g;
+  output = output.replaceAll(acceptLanguageRegEx, 'accept-language:<lang>\n');
+
+  // Stabilize URL-encoded file paths
+  const fileUriRegEx = /file%3A%2F%2F%2F[^)\n]+/g;
+  output = output.replaceAll(fileUriRegEx, '<file-path>');
+
   return output;
+}
+
+export function getMockAggregatedIssue(): sinon.SinonStubbedInstance<DevTools.AggregatedIssue> {
+  const mockAggregatedIssue = sinon.createStubInstance(
+    DevTools.AggregatedIssue,
+  );
+  mockAggregatedIssue.getAllIssues.returns([]);
+  return mockAggregatedIssue;
+}
+
+export function getMockBrowser(options?: {
+  process?: ChildProcess | null;
+  wsEndpoint?: string;
+}): Browser {
+  const page = createMockPuppeteerPage();
+  const listener = mockListener();
+  page.on.callsFake((eventName, handler) => {
+    listener.on(eventName, handler);
+    return page;
+  });
+  page.off.callsFake((eventName, handler) => {
+    if (handler) {
+      listener.off(eventName, handler);
+    }
+    return page;
+  });
+  (page as unknown as {emit: typeof listener.emit}).emit = listener.emit;
+  const pages = [page as unknown as Page];
+  return {
+    process() {
+      return options?.process ?? null;
+    },
+    wsEndpoint() {
+      return options?.wsEndpoint ?? '';
+    },
+    pages() {
+      return Promise.resolve(pages);
+    },
+    ...mockListener(),
+  } as Browser;
+}
+
+export const CLI_PATH = path.resolve('build/src/bin/chrome-devtools.js');
+
+export async function runCli(
+  args: string[],
+  sessionId?: string,
+  options?: {cwd?: string},
+): Promise<{status: number | null; stdout: string; stderr: string}> {
+  return await new Promise((resolve, reject) => {
+    const finalArgs = [...args];
+    if (sessionId) {
+      // Prepend so that the flag is not swallowed by a trailing `--`.
+      finalArgs.unshift('--sessionId', sessionId);
+    }
+    const child = spawn('node', [CLI_PATH, ...finalArgs], {
+      env: process.env,
+      cwd: options?.cwd,
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', chunk => {
+      stdout += chunk;
+      process.stdout.write(chunk);
+    });
+    child.stderr.on('data', chunk => {
+      stderr += chunk;
+      process.stderr.write(chunk);
+    });
+    child.on('close', status => resolve({status, stdout, stderr}));
+    child.on('error', reject);
+  });
+}
+
+export async function assertDaemonIsNotRunning(sessionId?: string) {
+  const result = await runCli(['status'], sessionId);
+  assert.strictEqual(
+    result.stdout,
+    'chrome-devtools-mcp daemon is not running.\n',
+  );
+}
+
+/**
+ * Stops the daemon in-process. Use it for test cleanup: it does not spawn
+ * a CLI process, which takes about a second per call.
+ */
+export async function stopDaemonForCleanup(sessionId: string) {
+  await stopDaemon(sessionId);
+  assert.ok(!isDaemonRunning(sessionId), 'daemon is still running');
+}
+
+/**
+ * Creates a new CLI session ID for one test and stops its daemon after the
+ * test. Each test gets its own session, so tests can run concurrently.
+ */
+export function createCliSession(t: TestContext): string {
+  const sessionId = crypto.randomUUID();
+  t.after(async () => {
+    await stopDaemonForCleanup(sessionId);
+  });
+  return sessionId;
+}
+
+export async function assertDaemonIsRunning(sessionId?: string) {
+  const result = await runCli(['status'], sessionId);
+  assert.ok(
+    result.stdout.startsWith('chrome-devtools-mcp daemon is running.\n'),
+    'chrome-devtools-mcp daemon is not running',
+  );
+}
+
+export async function waitExecutionFor(
+  func: () => Promise<void>,
+  timeout: number,
+) {
+  const start = Date.now();
+  while (Date.now() - start < 10000) {
+    try {
+      await func();
+      return;
+    } catch {
+      await new Promise(resolve => setTimeout(resolve, 100)); // wait and retry
+    }
+  }
+
+  throw new Error(`Timeout of ${timeout} reached.`);
+}
+
+export function createTempDir(
+  prefix = 'chrome-devtools-test-',
+  baseDir = os.tmpdir(),
+) {
+  const dirPath = fs.mkdtempSync(path.join(baseDir, prefix));
+  return {
+    path: dirPath,
+    [Symbol.dispose]() {
+      try {
+        fs.rmSync(dirPath, {recursive: true, force: true});
+      } catch {
+        // ignore
+      }
+    },
+  };
+}
+
+export function createTempFile(
+  content: string,
+  fileName: string,
+  baseDir = os.tmpdir(),
+) {
+  const dirPath = fs.mkdtempSync(
+    path.join(baseDir, 'chrome-devtools-test-file-'),
+  );
+  const filePath = path.join(dirPath, fileName);
+  fs.writeFileSync(filePath, content);
+  return {
+    path: filePath,
+    [Symbol.dispose]() {
+      try {
+        fs.rmSync(dirPath, {recursive: true, force: true});
+      } catch {
+        // ignore
+      }
+    },
+  };
 }

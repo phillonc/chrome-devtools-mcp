@@ -15,7 +15,9 @@
     "noFallthroughCasesInSwitch": true,
     "incremental": true,
     "allowJs": true,
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
     "useUnknownInCatchVariables": false
   },
-  "include": ["./**/*.ts", "./**/*.js"]
+  "include": ["./**/*.ts", "./**/*.js", "./**/*.mjs"]
 }

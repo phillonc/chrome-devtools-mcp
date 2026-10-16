@@ -53,9 +53,18 @@ exports[`performance > performance_stop_trace > returns the high level summary o
 The performance trace has been stopped.
 ## Summary of Performance trace findings:
 URL: https://web.dev/
-Bounds: {min: 122410994891, max: 122416385853}
+Trace bounds: {min: 122410994891, max: 122416385853}
 CPU throttling: none
 Network throttling: none
+
+# Available insight sets
+
+The following is a list of insight sets. An insight set covers a specific part of the trace, split by navigations. The insights within each insight set are specific to that part of the trace. Be sure to consider the insight set id and bounds when calling functions. If no specific insight set or navigation is mentioned, assume the user is referring to the first one.
+
+## insight set id: NAVIGATION_0
+
+URL: https://web.dev/
+Bounds: {min: 122410996889, max: 122416385853}
 Metrics (lab / observed):
   - LCP: 129 ms, event: (eventKey: r-6063, ts: 122411126100), nodeId: 7
   - LCP breakdown:
@@ -64,7 +73,19 @@ Metrics (lab / observed):
     - Load duration: 15 ms, bounds: {min: 122411037986, max: 122411052690}
     - Render delay: 73 ms, bounds: {min: 122411052690, max: 122411126100}
   - CLS: 0.00
-Metrics (field / real users): n/a – no data for this page in CrUX
+Metrics (field / real users):
+  - LCP: 2595 ms (scope: url)
+  - LCP breakdown:
+    - TTFB: 1273 ms (scope: url)
+    - Load delay: 86 ms (scope: url)
+    - Load duration: 451 ms (scope: url)
+    - Render delay: 786 ms (scope: url)
+  - INP: 140 ms (scope: url)
+  - CLS: 0.06 (scope: url)
+  - The above data is from CrUX–Chrome User Experience Report. It's how the page performs for real users.
+  - The values shown above are the p75 measure of all real Chrome users
+  - The scope indicates if the data came from the entire origin, or a specific url
+  - Lab metrics describe how this specific page load performed, while field metrics are an aggregation of results from real-world users. Best practice is to prioritize metrics that are bad in field data. Lab metrics may be better or worse than fields metrics depending on the developer's machine, network, or the actions performed while tracing.
 Available insights:
   - insight name: LCPBreakdown
     description: Each [subpart has specific improvement strategies](https://developer.chrome.com/docs/performance/insights/lcp-breakdown). Ideally, most of the LCP time should be spent on loading the resources, not within delays.
@@ -100,7 +121,7 @@ Information on performance traces may contain main thread activity represented a
 
 Each call frame is presented in the following format:
 
-'id;eventKey;name;duration;selfTime;urlIndex;childRange;[S]'
+'id;eventKey;name;duration;selfTime;urlIndex;childRange;[line];[column];[S]'
 
 Key definitions:
 
@@ -111,15 +132,17 @@ Key definitions:
 * selfTime: The time spent directly within the call frame, excluding its children's execution.
 * urlIndex: Index referencing the "All URLs" list. Empty if no specific script URL is associated.
 * childRange: Specifies the direct children of this node using their IDs. If empty ('' or 'S' at the end), the node has no children. If a single number (e.g., '4'), the node has one child with that ID. If in the format 'firstId-lastId' (e.g., '4-5'), it indicates a consecutive range of child IDs from 'firstId' to 'lastId', inclusive.
+* line: An optional field for a call frame's line number. This is where the function is defined.
+* column: An optional field for a call frame's column number. This is where the function is defined.
 * S: _Optional_. The letter 'S' terminates the line if that call frame was selected by the user.
 
 Example Call Tree:
 
-1;r-123;main;500;100;;
-2;r-124;update;200;50;;3
-3;p-49575-15428179-2834-374;animate;150;20;0;4-5;S
-4;p-49575-15428179-3505-1162;calculatePosition;80;80;;
-5;p-49575-15428179-5391-2767;applyStyles;50;50;;
+1;r-123;main;500;100;0;1;;
+2;r-124;update;200;50;;3;0;1;
+3;p-49575-15428179-2834-374;animate;150;20;0;4-5;0;1;S
+4;p-49575-15428179-3505-1162;calculatePosition;80;80;0;1;;
+5;p-49575-15428179-5391-2767;applyStyles;50;50;0;1;;
 
 
 Network requests are formatted like this:

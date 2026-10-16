@@ -4,26 +4,40 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import {logger} from '../logger.js';
+import type {ParsedArguments} from '../config/ConfigParser.js';
+import type {CdpPage} from '../third_party/index.js';
 import {zod} from '../third_party/index.js';
+import {logger} from '../utils/logger.js';
+import {validateUrl} from '../utils/url.js';
 
 import {ToolCategory} from './categories.js';
-import {CLOSE_PAGE_ERROR, defineTool, timeoutSchema} from './ToolDefinition.js';
+import {
+  CLOSE_PAGE_ERROR,
+  definePageTool,
+  defineTool,
+  timeoutSchema,
+} from './ToolDefinition.js';
 
-export const listPages = defineTool({
-  name: 'list_pages',
-  description: `Get a list of pages open in the browser.`,
-  annotations: {
-    category: ToolCategory.NAVIGATION,
-    readOnlyHint: true,
-  },
-  schema: {},
-  handler: async (_request, response) => {
-    response.setIncludePages(true);
-  },
+export const listPages = defineTool((args: ParsedArguments) => {
+  return {
+    name: 'list_pages',
+    description: `Get a list of pages${args?.categoryExtensions ? ' including extension service workers' : ''} open in the browser.`,
+    annotations: {
+      category: ToolCategory.NAVIGATION,
+      readOnlyHint: true,
+    },
+    schema: {},
+    blockedByDialog: false,
+    verifyFilesSchema: {},
+    handler: async (_request, response) => {
+      response.setIncludePages(true);
+      response.setListThirdPartyDeveloperTools();
+      response.setListWebMcpTools();
+    },
+  };
 });
 
-export const selectPage = defineTool({
+export const selectPage = defineTool((args: ParsedArguments) => ({
   name: 'select_page',
   description: `Select a page as a context for future tool calls.`,
   annotations: {
@@ -31,21 +45,32 @@ export const selectPage = defineTool({
     readOnlyHint: true,
   },
   schema: {
-    pageIdx: zod
+    pageId: zod
       .number()
       .describe(
-        'The index of the page to select. Call list_pages to list pages.',
+        `The ID of the page to select. Call ${listPages(args).name} to get available pages.`,
       ),
+    bringToFront: zod
+      .boolean()
+      .optional()
+      .describe('Whether to focus the page and bring it to the top.'),
   },
+  blockedByDialog: false,
+  verifyFilesSchema: {},
   handler: async (request, response, context) => {
-    const page = context.getPageByIdx(request.params.pageIdx);
-    await page.bringToFront();
-    context.setSelectedPageIdx(request.params.pageIdx);
+    const page = context.getPageById(request.params.pageId);
+    await page.init();
+    context.selectPage(page);
     response.setIncludePages(true);
+    response.setListThirdPartyDeveloperTools();
+    response.setListWebMcpTools();
+    if (request.params.bringToFront) {
+      await page.pptrPage.bringToFront();
+    }
   },
-});
+}));
 
-export const closePage = defineTool({
+export const closePage = defineTool(() => ({
   name: 'close_page',
   description: `Closes the page by its index. The last open page cannot be closed.`,
   annotations: {
@@ -53,15 +78,15 @@ export const closePage = defineTool({
     readOnlyHint: false,
   },
   schema: {
-    pageIdx: zod
+    pageId: zod
       .number()
-      .describe(
-        'The index of the page to close. Call list_pages to list pages.',
-      ),
+      .describe('The ID of the page to close. Call list_pages to list pages.'),
   },
+  blockedByDialog: false,
+  verifyFilesSchema: {},
   handler: async (request, response, context) => {
     try {
-      await context.closePage(request.params.pageIdx);
+      await context.closePage(request.params.pageId);
     } catch (err) {
       if (err.message === CLOSE_PAGE_ERROR) {
         response.appendResponseLine(err.message);
@@ -70,147 +95,268 @@ export const closePage = defineTool({
       }
     }
     response.setIncludePages(true);
+    response.setListThirdPartyDeveloperTools();
   },
-});
+}));
 
-export const newPage = defineTool({
-  name: 'new_page',
-  description: `Creates a new page`,
-  annotations: {
-    category: ToolCategory.NAVIGATION,
-    readOnlyHint: false,
-  },
-  schema: {
-    url: zod.string().describe('URL to load in a new page.'),
-    ...timeoutSchema,
-  },
-  handler: async (request, response, context) => {
-    const page = await context.newPage();
-
-    await context.waitForEventsAfterAction(async () => {
-      await page.goto(request.params.url, {
-        timeout: request.params.timeout,
+export const newPage = defineTool((args: ParsedArguments) => {
+  return {
+    name: 'new_page',
+    description: `Open a new tab and load a URL. Use project URL if not specified otherwise.`,
+    annotations: {
+      category: ToolCategory.NAVIGATION,
+      readOnlyHint: false,
+    },
+    schema: {
+      url: zod.string().describe('URL to load in a new page.'),
+      background: zod
+        .boolean()
+        .optional()
+        .describe(
+          'Whether to open the page in the background without bringing it to the front. Default is false (foreground).',
+        ),
+      isolatedContext: zod
+        .string()
+        .optional()
+        .describe(
+          'If specified, the page is created in an isolated browser context with the given name. ' +
+            'Pages in the same browser context share cookies and storage. ' +
+            'Pages in different browser contexts are fully isolated (useful for clean-slate testing of cookies and authentication).',
+        ),
+      ...timeoutSchema,
+    },
+    blockedByDialog: false,
+    verifyFilesSchema: {},
+    handler: async (request, response, context) => {
+      validateUrl(request.params.url, {
+        javascriptEvaluation: args?.javascriptEvaluation,
+        categoryExtensions: args?.categoryExtensions,
+        fileNavigations: args?.fileNavigations,
       });
-    });
 
-    response.setIncludePages(true);
-  },
+      const page = await context.newPage(
+        request.params.background,
+        request.params.isolatedContext,
+      );
+
+      await page.waitForEventsAfterAction(
+        async () => {
+          await page.pptrPage.goto(request.params.url, {
+            timeout: request.params.timeout,
+          });
+        },
+        {timeout: request.params.timeout},
+      );
+
+      response.setIncludePages(true);
+      response.setListThirdPartyDeveloperTools();
+    },
+  };
 });
 
-export const navigatePage = defineTool({
-  name: 'navigate_page',
-  description: `Navigates the currently selected page to a URL.`,
-  annotations: {
-    category: ToolCategory.NAVIGATION,
-    readOnlyHint: false,
-  },
-  schema: {
-    type: zod
-      .enum(['url', 'back', 'forward', 'reload'])
-      .optional()
-      .describe(
-        'Navigate the page by URL, back or forward in history, or reload.',
-      ),
-    url: zod.string().optional().describe('Target URL (only type=url)'),
-    ...timeoutSchema,
-  },
-  handler: async (request, response, context) => {
-    const page = context.getSelectedPage();
-    const options = {
-      timeout: request.params.timeout,
-    };
+export const navigatePage = definePageTool((args: ParsedArguments) => {
+  return {
+    name: 'navigate_page',
+    description: `Go to a URL, or back, forward, or reload. Use project URL if not specified otherwise.`,
+    annotations: {
+      category: ToolCategory.NAVIGATION,
+      readOnlyHint: false,
+    },
+    schema: {
+      type: zod
+        .enum(['url', 'back', 'forward', 'reload'])
+        .optional()
+        .describe(
+          'Navigate the page by URL, back or forward in history, or reload.',
+        ),
+      url: zod.string().optional().describe('Target URL (only type=url)'),
+      ignoreCache: zod
+        .boolean()
+        .optional()
+        .describe('Whether to ignore cache on reload.'),
+      handleBeforeUnload: zod
+        .enum(['accept', 'dismiss'])
+        .optional()
+        .describe(
+          'Whether to auto accept or beforeunload dialogs triggered by this navigation. Default is accept.',
+        ),
+      ...(args?.javascriptEvaluation !== false
+        ? {
+            initScript: zod
+              .string()
+              .optional()
+              .describe(
+                'A JavaScript script to be executed on each new document before any other scripts for the next navigation.',
+              ),
+          }
+        : {}),
+      ...timeoutSchema,
+    },
+    blockedByDialog: false,
+    verifyFilesSchema: {},
+    handler: async (request, response) => {
+      const page = request.page;
+      const options = {
+        timeout: request.params.timeout,
+      };
 
-    if (!request.params.type && !request.params.url) {
-      throw new Error('Either URL or a type is required.');
-    }
-
-    if (!request.params.type) {
-      request.params.type = 'url';
-    }
-
-    await context.waitForEventsAfterAction(async () => {
-      switch (request.params.type) {
-        case 'url':
-          if (!request.params.url) {
-            throw new Error('A URL is required for navigation of type=url.');
-          }
-          try {
-            await page.goto(request.params.url, options);
-            response.appendResponseLine(
-              `Successfully navigated to ${request.params.url}.`,
-            );
-          } catch (error) {
-            response.appendResponseLine(
-              `Unable to navigate in the  selected page: ${error.message}.`,
-            );
-          }
-          break;
-        case 'back':
-          try {
-            await page.goBack(options);
-            response.appendResponseLine(
-              `Successfully navigated back to ${page.url()}.`,
-            );
-          } catch (error) {
-            response.appendResponseLine(
-              `Unable to navigate back in the selected page: ${error.message}.`,
-            );
-          }
-          break;
-        case 'forward':
-          try {
-            await page.goForward(options);
-            response.appendResponseLine(
-              `Successfully navigated forward to ${page.url()}.`,
-            );
-          } catch (error) {
-            response.appendResponseLine(
-              `Unable to navigate forward in the selected page: ${error.message}.`,
-            );
-          }
-          break;
-        case 'reload':
-          try {
-            await page.reload(options);
-            response.appendResponseLine(`Successfully reloaded the page.`);
-          } catch (error) {
-            response.appendResponseLine(
-              `Unable to reload the selected page: ${error.message}.`,
-            );
-          }
-          break;
+      if (!request.params.type && !request.params.url) {
+        throw new Error('Either URL or a type is required.');
       }
-    });
 
-    response.setIncludePages(true);
-  },
+      if (!request.params.type) {
+        request.params.type = 'url';
+      }
+
+      if (request.params.url) {
+        validateUrl(request.params.url, {
+          javascriptEvaluation: args?.javascriptEvaluation,
+          categoryExtensions: args?.categoryExtensions,
+          fileNavigations: args?.fileNavigations,
+        });
+      }
+
+      let initScriptId: string | undefined;
+      if (request.params.initScript) {
+        const {identifier} = await page.pptrPage.evaluateOnNewDocument(
+          request.params.initScript,
+        );
+        initScriptId = identifier;
+      }
+
+      try {
+        const action = request.params.handleBeforeUnload ?? 'accept';
+        const result = await page.waitForEventsAfterAction(
+          async () => {
+            switch (request.params.type) {
+              case 'url':
+                if (!request.params.url) {
+                  throw new Error(
+                    'A URL is required for navigation of type=url.',
+                  );
+                }
+                try {
+                  await page.pptrPage.goto(request.params.url, options);
+                  response.appendResponseLine(
+                    `Successfully navigated to ${request.params.url}.`,
+                  );
+                } catch (error) {
+                  response.appendResponseLine(
+                    `Unable to navigate in the selected page: ${error.message}.`,
+                  );
+                }
+                break;
+              case 'back':
+                try {
+                  await page.pptrPage.goBack(options);
+                  response.appendResponseLine(
+                    `Successfully navigated back to ${page.pptrPage.url()}.`,
+                  );
+                } catch (error) {
+                  response.appendResponseLine(
+                    `Unable to navigate back in the selected page: ${error.message}.`,
+                  );
+                }
+                break;
+              case 'forward':
+                try {
+                  await page.pptrPage.goForward(options);
+                  response.appendResponseLine(
+                    `Successfully navigated forward to ${page.pptrPage.url()}.`,
+                  );
+                } catch (error) {
+                  response.appendResponseLine(
+                    `Unable to navigate forward in the selected page: ${error.message}.`,
+                  );
+                }
+                break;
+              case 'reload':
+                try {
+                  await page.pptrPage.reload({
+                    ...options,
+                    ignoreCache: request.params.ignoreCache,
+                  });
+                  response.appendResponseLine(
+                    `Successfully reloaded the page.`,
+                  );
+                } catch (error) {
+                  response.appendResponseLine(
+                    `Unable to reload the selected page: ${error.message}.`,
+                  );
+                }
+                break;
+            }
+          },
+          {
+            timeout: request.params.timeout,
+            handleDialog: {beforeunload: action},
+          },
+        );
+        if (result.dialogHandled) {
+          response.appendResponseLine(
+            `${action === 'dismiss' ? 'Dismissed' : 'Accepted'} a beforeunload dialog.`,
+          );
+          page.clearDialog();
+        }
+      } finally {
+        if (initScriptId) {
+          await page.pptrPage
+            .removeScriptToEvaluateOnNewDocument(initScriptId)
+            .catch(error => {
+              logger?.(`Failed to remove init script`, error);
+            });
+        }
+      }
+
+      response.setIncludePages(true);
+      response.setListThirdPartyDeveloperTools();
+      response.setListWebMcpTools();
+    },
+  };
 });
 
-export const resizePage = defineTool({
+export const resizePage = definePageTool(() => ({
   name: 'resize_page',
-  description: `Resizes the selected page's window so that the page has specified dimension`,
+  description: `Resizes the page's window so that the page has specified dimension`,
   annotations: {
     category: ToolCategory.EMULATION,
     readOnlyHint: false,
   },
   schema: {
-    width: zod.number().describe('Page width'),
-    height: zod.number().describe('Page height'),
+    width: zod.number().int().positive().describe('Page width'),
+    height: zod.number().int().positive().describe('Page height'),
   },
-  handler: async (request, response, context) => {
-    const page = context.getSelectedPage();
+  blockedByDialog: false,
+  verifyFilesSchema: {},
+  handler: async (request, response) => {
+    const page = request.page;
 
-    // @ts-expect-error internal API for now.
-    await page.resize({
+    try {
+      const browser = page.pptrPage.browser();
+      const windowId = await page.pptrPage.windowId();
+
+      const bounds = await browser.getWindowBounds(windowId);
+
+      if (bounds.windowState === 'fullscreen') {
+        // Have to call this twice on Ubuntu when the window is in fullscreen mode.
+        await browser.setWindowBounds(windowId, {windowState: 'normal'});
+        await browser.setWindowBounds(windowId, {windowState: 'normal'});
+      } else if (bounds.windowState !== 'normal') {
+        await browser.setWindowBounds(windowId, {windowState: 'normal'});
+      }
+    } catch {
+      // Window APIs are not supported on all platforms
+    }
+    await page.pptrPage.resize({
       contentWidth: request.params.width,
       contentHeight: request.params.height,
     });
 
     response.setIncludePages(true);
   },
-});
+}));
 
-export const handleDialog = defineTool({
+export const handleDialog = definePageTool(() => ({
   name: 'handle_dialog',
   description: `If a browser dialog was opened, use this command to handle it`,
   annotations: {
@@ -226,8 +372,11 @@ export const handleDialog = defineTool({
       .optional()
       .describe('Optional prompt text to enter into the dialog.'),
   },
-  handler: async (request, response, context) => {
-    const dialog = context.getDialog();
+  blockedByDialog: false,
+  verifyFilesSchema: {},
+  handler: async (request, response) => {
+    const page = request.page;
+    const dialog = page.getDialog();
     if (!dialog) {
       throw new Error('No open dialog found');
     }
@@ -238,7 +387,7 @@ export const handleDialog = defineTool({
           await dialog.accept(request.params.promptText);
         } catch (err) {
           // Likely already handled by the user outside of MCP.
-          logger(err);
+          logger?.(err);
         }
         response.appendResponseLine('Successfully accepted the dialog');
         break;
@@ -248,14 +397,33 @@ export const handleDialog = defineTool({
           await dialog.dismiss();
         } catch (err) {
           // Likely already handled.
-          logger(err);
+          logger?.(err);
         }
         response.appendResponseLine('Successfully dismissed the dialog');
         break;
       }
     }
 
-    context.clearDialog();
+    page.clearDialog();
     response.setIncludePages(true);
   },
-});
+}));
+
+export const getTabId = definePageTool(() => ({
+  name: 'get_tab_id',
+  description: `Get the tab ID of the page`,
+  annotations: {
+    category: ToolCategory.NAVIGATION,
+    readOnlyHint: true,
+    conditions: ['experimentalInteropTools'],
+  },
+  schema: {},
+  blockedByDialog: false,
+  verifyFilesSchema: {},
+  handler: async (request, response) => {
+    const page = request.page;
+    const tabId = (page.pptrPage as unknown as CdpPage)._tabId;
+    response.setTabId(tabId);
+    response.appendResponseLine(`Tab ID: ${tabId}`);
+  },
+}));
