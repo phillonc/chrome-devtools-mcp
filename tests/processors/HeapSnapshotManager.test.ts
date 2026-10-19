@@ -5,7 +5,7 @@
  */
 
 import assert from 'node:assert';
-import {describe, it, after, afterEach, before} from 'node:test';
+import {describe, it, after, before} from 'node:test';
 
 import sinon from 'sinon';
 
@@ -13,10 +13,6 @@ import {HeapSnapshotManager} from '../../src/processors/HeapSnapshotManager.js';
 import {DevTools} from '../../src/third_party/index.js';
 
 describe('HeapSnapshotManager', () => {
-  afterEach(() => {
-    sinon.restore();
-  });
-
   it('rejects when a file without .heapsnapshot or .heaptimeline extension is passed', async () => {
     const manager = new HeapSnapshotManager();
 
@@ -71,13 +67,12 @@ describe('HeapSnapshotManager', () => {
 
       const lastDiff = classDiffs.at(-1);
       assert.ok(lastDiff);
-      const detailedDiff = await manager.getDetailedClassDiff(
+      const {classDiff} = await manager.getDetailedClassDiff(
         filePathA,
         filePathB,
         lastDiff.index,
       );
-      assert.strictEqual(detailedDiff.index, lastDiff.index);
-      assert.strictEqual(detailedDiff.className, lastDiff.className);
+      assert.deepStrictEqual(classDiff, lastDiff);
     });
 
     // Verifies that the caching mechanism in HeapSnapshotManager correctly

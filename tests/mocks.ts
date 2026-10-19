@@ -22,13 +22,15 @@
  *   sinon.assert.calledOnceWithExactly(page.emulate, {networkConditions: 'Slow 3G'});
  */
 
-import type {Frame} from 'puppeteer-core';
+import './setupDevTools.js';
+
+import type {Frame, Mouse, SerializedAXNode} from 'puppeteer-core';
 import sinon from 'sinon';
 
 import {
   type ParsedArguments,
-  ConfigParser,
-} from '../src/config/ConfigParser.js';
+  ServerConfig,
+} from '../src/config/ServerConfig.js';
 import {McpContext} from '../src/McpContext.js';
 import {McpPage} from '../src/McpPage.js';
 import {McpResponse} from '../src/McpResponse.js';
@@ -41,11 +43,14 @@ import type {
   HeapSnapshotClassDiffTotals,
   HeapSnapshotDetailedClassDiff,
   HeapSnapshotDiff,
+  HeapSnapshotDiffObject,
 } from '../src/processors/HeapSnapshotManager.js';
 import {
+  Accessibility,
   CdpBrowser,
   CdpExtension,
   CdpFrame,
+  CdpMouse,
   CdpPage,
   CDPSession,
   Connection,
@@ -71,12 +76,52 @@ import type {
   RunnerResult,
 } from '../src/third_party/index.js';
 
+export type MockPuppeteerPage = sinon.SinonStubbedInstance<Page> & {
+  webmcp: sinon.SinonStubbedInstance<WebMCP>;
+  tracing: sinon.SinonStubbedInstance<Tracing>;
+  mouse: sinon.SinonStubbedInstance<Mouse>;
+  accessibility: sinon.SinonStubbedInstance<Accessibility>;
+  cdpSession: {
+    on: sinon.SinonStub;
+    off: sinon.SinonStub;
+    send: sinon.SinonStub;
+    target: sinon.SinonStub;
+    emit: (eventName: string | symbol | number, data?: unknown) => void;
+  };
+};
+
 export type MockMcpPage = sinon.SinonStubbedInstance<McpPage> & {
-  pptrPage: sinon.SinonStubbedInstance<Page>;
+  pptrPage: MockPuppeteerPage;
   target: sinon.SinonStubbedInstance<MockTarget>;
 };
 export type MockMcpContext = sinon.SinonStubbedInstance<McpContext>;
 export type MockMcpResponse = sinon.SinonStubbedInstance<McpResponse>;
+
+export interface ProtocolAXNode extends SerializedAXNode {
+  loaderId?: string;
+  backendNodeId?: number;
+  children?: ProtocolAXNode[];
+  elementHandle: () => Promise<ElementHandle<Element> | null>;
+}
+
+export function createMockAXNode(
+  role: string,
+  options: {
+    name?: string;
+    loaderId?: string;
+    backendNodeId?: number;
+    children?: ProtocolAXNode[];
+  } = {},
+): ProtocolAXNode {
+  return {
+    role,
+    name: options.name,
+    loaderId: options.loaderId,
+    backendNodeId: options.backendNodeId,
+    children: options.children,
+    elementHandle: async () => null,
+  };
+}
 export type MockDOMNode = sinon.SinonStubbedInstance<DevTools.DOMModel.DOMNode>;
 export type MockCSSProperty =
   sinon.SinonStubbedInstance<DevTools.CSSProperty.CSSProperty>;
@@ -216,10 +261,7 @@ export function createMockCDPSession(): sinon.SinonStubbedInstance<MockCDPSessio
   return session;
 }
 
-export function createMockPuppeteerPage(): sinon.SinonStubbedInstance<Page> & {
-  webmcp: sinon.SinonStubbedInstance<WebMCP>;
-  tracing: sinon.SinonStubbedInstance<Tracing>;
-} {
+export function createMockPuppeteerPage(): MockPuppeteerPage {
   const page = sinon.createStubInstance(
     CdpPage,
   ) as unknown as sinon.SinonStubbedInstance<Page>;
@@ -292,10 +334,32 @@ export function createMockPuppeteerPage(): sinon.SinonStubbedInstance<Page> & {
     configurable: true,
   });
 
+  const mouse = sinon.createStubInstance(
+    CdpMouse,
+  ) as unknown as sinon.SinonStubbedInstance<Mouse>;
+  Object.defineProperty(page, 'mouse', {
+    value: mouse,
+    writable: true,
+    configurable: true,
+  });
+
+  const accessibility = sinon.createStubInstance(Accessibility);
+  Object.defineProperty(page, 'accessibility', {
+    value: accessibility,
+    writable: true,
+    configurable: true,
+  });
+
   page.emulateFocusedPage.resolves();
   page.evaluateHandle.resolves(createMockElementHandle().handle);
 
-  return Object.assign(page, {webmcp, tracing});
+  return Object.assign(page, {
+    webmcp,
+    tracing,
+    mouse,
+    accessibility,
+    cdpSession,
+  });
 }
 
 export function createMockWebMCPTool(options: {
@@ -367,7 +431,7 @@ export function createMockPuppeteerTarget(
 
 export function createMockMcpPage(
   options: {
-    pptrPage?: sinon.SinonStubbedInstance<Page>;
+    pptrPage?: MockPuppeteerPage;
     target?: sinon.SinonStubbedInstance<MockTarget>;
   } = {},
 ): MockMcpPage {
@@ -387,6 +451,7 @@ export function createMockMcpPage(
     return {};
   });
   page.getWebMcpTools.returns([]);
+  page.discoverThirdPartyDeveloperTools.resolves([]);
   Object.defineProperty(page, 'pptrPage', {
     value: pptrPage,
     writable: true,
@@ -401,11 +466,16 @@ export function createMockMcpPage(
 }
 
 export function createMockDialog(
-  options: {type?: Protocol.Page.DialogType; message?: string} = {},
+  options: {
+    type?: Protocol.Page.DialogType;
+    message?: string;
+    handled?: boolean;
+  } = {},
 ): sinon.SinonStubbedInstance<Dialog> {
   const dialog = sinon.createStubInstance(Dialog);
   dialog.type.returns(options.type ?? 'alert');
   dialog.message.returns(options.message ?? '');
+  sinon.stub(dialog, 'handled').get(() => options.handled ?? false);
   return dialog;
 }
 
@@ -1103,20 +1173,22 @@ export function createMockHeapSnapshotDiff(
   };
 }
 
-export function createMockDetailedClassDiff(): HeapSnapshotDetailedClassDiff {
+export function createMockDiffObject(
+  options: Partial<HeapSnapshotDiffObject> = {},
+): HeapSnapshotDiffObject {
   return {
-    index: 0,
-    className: 'TestClass',
-    addedCount: 1,
-    removedCount: 0,
-    countDelta: 1,
-    addedSize: 10,
-    removedSize: 0,
-    sizeDelta: 10,
-    addedIds: [1],
-    addedSelfSizes: [10],
-    deletedIds: [],
-    deletedSelfSizes: [],
+    id: options.id ?? 1,
+    selfSize: options.selfSize ?? 10,
+    change: options.change ?? 'added',
+  };
+}
+
+export function createMockDetailedClassDiff(
+  options: Partial<HeapSnapshotDetailedClassDiff> = {},
+): HeapSnapshotDetailedClassDiff {
+  return {
+    classDiff: options.classDiff ?? createMockClassDiff(),
+    objects: options.objects ?? [createMockDiffObject()],
   };
 }
 
@@ -1235,12 +1307,10 @@ export function createMockContextAnalysisResult(): DevTools.HeapSnapshotModel.He
 export function createMockParsedArguments(
   options: Partial<ParsedArguments> = {},
 ): ParsedArguments {
-  const defaultArgs = new ConfigParser(
-    '0.0.0',
-    ['node', 'main.js'],
-    process.env,
-    false,
-  ).parse();
+  const defaultArgs = ServerConfig.applyDefaults(
+    {},
+    {suppressUsageStatisticsNotice: true},
+  );
   return {...defaultArgs, ...options};
 }
 

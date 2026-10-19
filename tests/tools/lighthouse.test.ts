@@ -7,7 +7,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import {afterEach, describe, it} from 'node:test';
+import {describe, it} from 'node:test';
 
 import sinon from 'sinon';
 
@@ -18,18 +18,38 @@ import {serverHooks} from '../server.js';
 import {html, withMcpContext} from '../utils.js';
 
 describe('lighthouse', () => {
-  afterEach(() => {
-    sinon.restore();
-  });
-
   const server = serverHooks();
   describe('lighthouse_audit', () => {
     it('runs Lighthouse audit by default (navigation, desktop)', async () => {
       server.addHtmlRoute('/test', html`<div>Test</div>`);
 
       await withMcpContext(async (response, context, args) => {
-        const page = context.getSelectedMcpPage().pptrPage;
+        const mcpPage = context.getSelectedMcpPage();
+        const page = mcpPage.pptrPage;
         await page.goto(server.getRoute('/test'));
+        await mcpPage.emulate({
+          viewport: {
+            width: 390,
+            height: 844,
+            deviceScaleFactor: 3,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: false,
+          },
+        });
+        const readViewport = () =>
+          page.evaluate(() => ({
+            width: window.innerWidth,
+            height: window.innerHeight,
+            deviceScaleFactor: window.devicePixelRatio,
+            screenWidth: screen.width,
+            orientation: screen.orientation.type,
+            maxTouchPoints: navigator.maxTouchPoints,
+          }));
+        const emulated = await readViewport();
+        assert.equal(emulated.width, 390);
+        assert.equal(emulated.deviceScaleFactor, 3);
+        assert.ok(emulated.maxTouchPoints > 0);
 
         await lighthouseAudit(args).handler(
           {
@@ -37,11 +57,15 @@ describe('lighthouse', () => {
               mode: 'navigation',
               device: 'desktop',
             },
-            page: context.getSelectedMcpPage(),
+            page: mcpPage,
           },
           response,
           context,
         );
+
+        // Lighthouse replaces and then clears the device metrics override, the
+        // emulated viewport must be back afterwards.
+        assert.deepEqual(await readViewport(), emulated);
 
         const data = response.attachedLighthouseResult;
         assert.ok(data);
@@ -58,6 +82,58 @@ describe('lighthouse', () => {
           assert.ok(stats.isFile());
         }
       });
+    });
+
+    it('explains which URLs navigation mode can audit', async () => {
+      const {page, context, response, args} = createHandlerMocks();
+      page.pptrPage.url.returns('file:///tmp/page.html');
+      const invalidUrl = Object.assign(new Error('INVALID_URL'), {
+        code: 'INVALID_URL',
+      });
+      sinon.stub(lighthouseRunner, 'navigation').rejects(invalidUrl);
+
+      await assert.rejects(
+        () =>
+          lighthouseAudit(args).handler(
+            {
+              params: {
+                mode: 'navigation',
+                device: 'desktop',
+              },
+              page,
+            },
+            response,
+            context,
+          ),
+        {
+          message:
+            'Lighthouse "navigation" mode cannot audit file:///tmp/page.html: it only supports http:, https:, chrome: and chrome-extension: URLs. Use mode "snapshot" to audit the page in its current state.',
+          cause: invalidUrl,
+        },
+      );
+    });
+
+    it('passes other navigation errors through unchanged', async () => {
+      const {page, context, response, args} = createHandlerMocks();
+      sinon
+        .stub(lighthouseRunner, 'navigation')
+        .rejects(new Error('PROTOCOL_TIMEOUT'));
+
+      await assert.rejects(
+        () =>
+          lighthouseAudit(args).handler(
+            {
+              params: {
+                mode: 'navigation',
+                device: 'desktop',
+              },
+              page,
+            },
+            response,
+            context,
+          ),
+        {message: 'PROTOCOL_TIMEOUT'},
+      );
     });
 
     it('restores emulation', async () => {
@@ -104,6 +180,42 @@ describe('lighthouse', () => {
         {message: 'Audit failed'},
       );
 
+      sinon.assert.calledOnceWithExactly(page.restoreEmulation);
+    });
+
+    it('fails when Lighthouse reports a runtime error', async () => {
+      const {page, context, response, args} = createHandlerMocks();
+      context.saveTemporaryFile.resolves({filepath: 'report.json'});
+      sinon.stub(lighthouseRunner, 'navigation').resolves(
+        createMockRunnerResult({
+          runtimeError: {
+            code: 'ERRORED_DOCUMENT_REQUEST',
+            message: 'Lighthouse was unable to reliably load the page.',
+          },
+        }),
+      );
+
+      await assert.rejects(
+        () =>
+          lighthouseAudit(args).handler(
+            {
+              params: {
+                mode: 'navigation',
+                device: 'desktop',
+              },
+              page,
+            },
+            response,
+            context,
+          ),
+        {
+          message:
+            'Lighthouse could not audit the page (ERRORED_DOCUMENT_REQUEST): Lighthouse was unable to reliably load the page. Reports: report.json, report.json',
+        },
+      );
+
+      sinon.assert.calledTwice(context.saveTemporaryFile);
+      sinon.assert.notCalled(response.attachLighthouseResult);
       sinon.assert.calledOnceWithExactly(page.restoreEmulation);
     });
 

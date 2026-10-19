@@ -16,7 +16,11 @@ import type {
   LaunchOptions,
 } from './third_party/index.js';
 import {Mutex, puppeteer} from './third_party/index.js';
-import {logger, puppeteerLogger} from './utils/logger.js';
+import {
+  logger,
+  puppeteerLogger,
+  redactConnectOptionsForLogging,
+} from './utils/logger.js';
 import {isAllowedUrl} from './utils/url.js';
 
 export interface BrowserManagerOptions {
@@ -280,6 +284,12 @@ export class BrowserManager {
         blocklist,
         allowlist,
         logger: puppeteerLogger,
+        // The entry points own signal handling and call close(), which
+        // closes the browser gracefully. Puppeteer's handlers would SIGKILL
+        // Chrome synchronously on the same signal and win the race.
+        handleSIGINT: false,
+        handleSIGTERM: false,
+        handleSIGHUP: false,
       });
       if (this.#options.logFile) {
         // FIXME: we are probably subscribing too late to catch startup logs. We
@@ -410,7 +420,10 @@ export class BrowserManager {
       );
     }
 
-    logger?.('Connecting Puppeteer to ', JSON.stringify(connectOptions));
+    logger?.(
+      'Connecting Puppeteer to ',
+      JSON.stringify(redactConnectOptionsForLogging(connectOptions)),
+    );
     try {
       const connected = await puppeteer.connect(connectOptions);
       logger?.('Connected Puppeteer');
