@@ -10,12 +10,12 @@ import {describe, it} from 'node:test';
 import sinon from 'sinon';
 
 import {DevToolsCommentBridge} from '../../src/devtools/DevToolsCommentBridge.js';
-import type {CommentThreadPayload} from '../../src/tools/comments.js';
 import {
   getDevtoolsComments,
   openDevtools,
   resolveDevtoolsComment,
   revealInDevtools,
+  type CommentThreadPayload,
 } from '../../src/tools/comments.js';
 import {createHandlerMocks, createMockPuppeteerPage} from '../mocks.js';
 
@@ -89,9 +89,9 @@ describe('comments tools', () => {
       ]);
     });
 
-    it('yields the tool lock while waiting', () => {
+    it('runs the handler unlocked while waiting', () => {
       const {args} = createHandlerMocks();
-      assert.strictEqual(getDevtoolsComments(args).yieldsToolLock, true);
+      assert.strictEqual(getDevtoolsComments(args).concurrency, 'none');
     });
 
     it('waits for a comment event and fetches again', async () => {

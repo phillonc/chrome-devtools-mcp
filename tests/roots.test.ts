@@ -15,6 +15,7 @@ import sinon from 'sinon';
 
 import type {McpContext} from '../src/McpContext.js';
 import {HeapSnapshotManager} from '../src/processors/HeapSnapshotManager.js';
+import {TaskRunner} from '../src/utils/TaskRunner.js';
 import {resolveCanonicalPath} from '../src/utils/files.js';
 import {escapeForLog} from '../src/utils/logger.js';
 
@@ -176,9 +177,26 @@ describe('McpContext path validation escaping', () => {
       config: createMockServerConfig({
         performanceCrux: false,
       }),
-      heapSnapshotManager: new HeapSnapshotManager(),
+      heapSnapshotManager: new HeapSnapshotManager(new TaskRunner()),
     });
   }
+
+  it('allows paths below a workspace root that is the filesystem root', async () => {
+    const context = await createContext();
+    const targetPath = path.resolve(
+      os.homedir(),
+      'a_very_unlikely_path_name_filesystem_root',
+    );
+    const canonicalPath = await resolveCanonicalPath(targetPath);
+    // Use the root of the canonical path so the test also holds when the home
+    // directory goes through a symlink or junction onto another drive.
+    const filesystemRoot = path.parse(canonicalPath).root;
+    context.setRoots([
+      {uri: pathToFileURL(filesystemRoot).href, name: 'filesystem root'},
+    ]);
+    const resolved = await context.validatePath(targetPath);
+    assert.strictEqual(resolved, canonicalPath);
+  });
 
   it('escapes the file path when it cannot be resolved', async () => {
     const context = await createContext();

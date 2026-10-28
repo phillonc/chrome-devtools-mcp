@@ -13,6 +13,9 @@ import type {
 import type {DevToolsData} from './tools/ToolDefinition.js';
 import type {TextSnapshotNode} from './types.js';
 import {logger} from './utils/logger.js';
+import {withTimeout} from './utils/timeout.js';
+
+const ACCESSIBILITY_SNAPSHOT_TIMEOUT_MS = 10_000;
 
 /**
  * InlineTextBox nodes are layout line fragments of a StaticText node. They
@@ -41,9 +44,9 @@ export class TextSnapshot {
     root: TextSnapshotNode;
     idToNode: Map<string, TextSnapshotNode>;
     snapshotId: string;
-    selectedElementUid?: string;
     hasSelectedElement: boolean;
     verbose: boolean;
+    selectedElementUid?: string;
   }) {
     this.root = data.root;
     this.idToNode = data.idToNode;
@@ -62,10 +65,16 @@ export class TextSnapshot {
     } = {},
   ): Promise<TextSnapshot> {
     const verbose = options.verbose ?? false;
-    const rootNode = await page.pptrPage.accessibility.snapshot({
-      includeIframes: true,
-      interestingOnly: !verbose,
-    });
+    const rootNode = await withTimeout(
+      page.pptrPage.accessibility.snapshot({
+        includeIframes: true,
+        interestingOnly: !verbose,
+      }),
+      {
+        timeout: ACCESSIBILITY_SNAPSHOT_TIMEOUT_MS,
+        message: `Timed out after ${ACCESSIBILITY_SNAPSHOT_TIMEOUT_MS}ms waiting for the accessibility tree. The page may have a pending navigation or a crashed renderer. Navigate or reload the page, or select another page.`,
+      },
+    );
     if (!rootNode) {
       throw new Error('Failed to create accessibility snapshot');
     }
@@ -126,7 +135,7 @@ export class TextSnapshot {
 
     const rootNodeWithId = assignIds(rootNode);
 
-    await TextSnapshot.insertExtraNodes(
+    await TextSnapshot.#insertExtraNodes(
       page,
       idToNode,
       seenUniqueIds,
@@ -186,7 +195,7 @@ export class TextSnapshot {
   // ExtraHandles represent DOM nodes which might not be part of the accessibility tree, e.g. DOM nodes
   // returned by third-party developer tools. We insert them into the tree by finding the closest ancestor
   // in the tree and inserting the node as a child. The ancestor's child nodes are re-parented if necessary.
-  private static async insertExtraNodes(
+  static async #insertExtraNodes(
     page: McpPage,
     idToNode: Map<string, TextSnapshotNode>,
     seenUniqueIds: Set<string>,

@@ -15,6 +15,7 @@ import {
 import {ToolCategory} from './categories.js';
 import {
   definePageTool,
+  type PageToolFactory,
   geolocationTransform,
   viewportTransform,
   zodTransform,
@@ -51,7 +52,7 @@ const throttlingOptions: [string, ...string[]] = [
   ...Object.keys(PredefinedNetworkConditions),
 ];
 
-export const emulate = definePageTool(() => ({
+export const emulate: PageToolFactory = definePageTool(() => ({
   name: 'emulate',
   description: `Emulates various features on the target page. Each call replaces all emulation settings (except extraHttpHeaders), so pass all desired settings in a single call.`,
   annotations: {
@@ -124,6 +125,7 @@ export const emulate = definePageTool(() => ({
       ),
   },
   blockedByDialog: true,
+  concurrency: 'exclusive',
   verifyFilesSchema: {},
   handler: async (request, response) => {
     const page = request.page;

@@ -4,7 +4,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import type {InferredOptionTypes} from '../third_party/cli.js';
+import {isDeepStrictEqual} from 'node:util';
+
 import {yargs} from '../third_party/cli.js';
 
 import {
@@ -15,17 +16,9 @@ import {
   mcpOptions,
   mcpOptionsForViaCli,
   stripYargsPositionalArgs,
+  type McpOptions,
+  type ParsedArguments,
 } from './mcp-options.js';
-
-type InferredMcpArguments = InferredOptionTypes<typeof mcpOptions>;
-
-export type ParsedArguments = Omit<
-  InferredMcpArguments,
-  'channel' | 'filesystemRoot'
-> & {
-  channel?: InferredMcpArguments['channel'];
-  filesystemRoot?: InferredMcpArguments['filesystemRoot'];
-};
 
 function isMcpOptionKey(key: string): key is keyof ParsedArguments {
   return key in mcpOptions;
@@ -45,7 +38,7 @@ function copyOption<K extends keyof ParsedArguments>(
 
 function filterExplicitArgs(
   args: Partial<ParsedArguments>,
-  baseOptions: typeof mcpOptions | typeof mcpOptionsForViaCli,
+  baseOptions: McpOptions,
 ): Partial<ParsedArguments> {
   const filtered: Partial<ParsedArguments> = {};
   for (const key of Object.keys(args)) {
@@ -73,9 +66,7 @@ function mergeLayer(
   return merged;
 }
 
-function parseDefaultArgs(
-  options: typeof mcpOptions | typeof mcpOptionsForViaCli,
-): ParsedArguments {
+function parseDefaultArgs(options: McpOptions): ParsedArguments {
   const parsed = yargs([])
     .parserConfiguration({
       'strip-aliased': true,
@@ -200,6 +191,8 @@ export class ServerConfig implements ReadonlyServerConfig {
     }
 
     if (isViaCli) {
+      resolvedArgs.slim = false;
+      resolvedArgs.pageIdRouting = true;
       if (
         resolvedArgs.filesystemRoot === DEFAULT_FILESYSTEM_ROOT &&
         explicitArgs.allowUnrestrictedPaths !== false
@@ -287,6 +280,20 @@ export class ServerConfig implements ReadonlyServerConfig {
   }
 
   /**
+   * Produces a new {@link ServerConfig} with updated config-file arguments,
+   * preserving this config's CLI arguments, config path, and environment.
+   */
+  withFileArgs(fileArgs: Partial<ParsedArguments>): ServerConfig {
+    return ServerConfig.create({
+      cliArgs: {...this.#cliArgs},
+      fileArgs,
+      configPath: this.#configPath,
+      env: this.#env,
+      suppressUsageStatisticsNotice: true,
+    });
+  }
+
+  /**
    * Produces a new {@link ServerConfig} that takes reloadable options from
    * `next` and keeps restart-required options from this config, preserving
    * `CLI > config file > defaults` precedence.
@@ -304,6 +311,26 @@ export class ServerConfig implements ReadonlyServerConfig {
       env: options?.env ?? this.#env,
       suppressUsageStatisticsNotice: true,
     });
+  }
+
+  /**
+   * Returns the restart-required options whose resolved values differ between
+   * this config and `next`.
+   */
+  getRestartRequiredChanges(next: ServerConfig): Array<keyof ParsedArguments> {
+    const changed: Array<keyof ParsedArguments> = [];
+    for (const name of Object.keys(mcpOptions)) {
+      if (
+        isMcpOptionKey(name) &&
+        !isReloadableOption(name) &&
+        (!isDeepStrictEqual(this.#fileArgs[name], next.#fileArgs[name]) ||
+          !isDeepStrictEqual(this.#cliArgs[name], next.#cliArgs[name])) &&
+        !isDeepStrictEqual(this.#resolved[name], next.#resolved[name])
+      ) {
+        changed.push(name);
+      }
+    }
+    return changed;
   }
 
   /**

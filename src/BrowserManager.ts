@@ -9,13 +9,14 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import type {ParsedArguments} from './config/ConfigParser.js';
-import type {
-  Browser,
-  ChromeReleaseChannel,
-  LaunchOptions,
+import type {ReadonlyServerConfig} from './config/ServerConfig.js';
+import {
+  Mutex,
+  puppeteer,
+  type Browser,
+  type ChromeReleaseChannel,
+  type LaunchOptions,
 } from './third_party/index.js';
-import {Mutex, puppeteer} from './third_party/index.js';
 import {
   logger,
   puppeteerLogger,
@@ -40,16 +41,16 @@ export class BrowserManager {
   #initPromise?: Promise<Browser>;
   #mutex = new Mutex();
   #closingCount = 0;
-  #serverArgs: ParsedArguments;
+  #config: ReadonlyServerConfig;
   #options: BrowserManagerOptions;
 
   #browserAttempt: BrowserAttempt = new BrowserAttempt();
 
   constructor(
-    serverArgs: ParsedArguments,
+    config: ReadonlyServerConfig,
     options: BrowserManagerOptions = {},
   ) {
-    this.#serverArgs = serverArgs;
+    this.#config = config;
     this.#options = options;
   }
 
@@ -95,7 +96,7 @@ export class BrowserManager {
   static rootSandboxLaunchError(
     error: Error,
     args: readonly string[],
-    uid = process.getuid?.(),
+    uid: number | undefined = process.getuid?.(),
   ): Error | undefined {
     if (uid !== 0) {
       return undefined;
@@ -186,8 +187,9 @@ export class BrowserManager {
    * McpContext initialization built on it — if ensureBrowser() already
    * resolved and it's that later step hanging (e.g. a dead CDP transport),
    * the token rotation alone does nothing, since #browser is already
-   * cached. Safe to forget unconditionally here: the tool mutex serializes
-   * every call, so there's no concurrent caller to disrupt.
+   * cached. Safe to forget unconditionally here: a tool call that already
+   * received a Browser keeps using it, so forgetting the cached value only
+   * makes the next ensureBrowser() reconnect.
    */
   abandonPendingAttempt(): void {
     this.#browserAttempt = new BrowserAttempt();
@@ -197,9 +199,9 @@ export class BrowserManager {
 
   async #initBrowser(): Promise<Browser> {
     if (
-      this.#serverArgs.browserUrl ||
-      this.#serverArgs.wsEndpoint ||
-      this.#serverArgs.autoConnect
+      this.#config.resolved.browserUrl ||
+      this.#config.resolved.wsEndpoint ||
+      this.#config.resolved.autoConnect
     ) {
       return await this.#connect();
     }
@@ -221,14 +223,14 @@ export class BrowserManager {
       allowedUrlPattern: allowlist,
       ignoreDefaultChromeArg,
       proxyServer,
-    } = this.#serverArgs;
+    } = this.#config.resolved;
 
     const profileDirName =
       channel && channel !== 'stable'
         ? `chrome-profile-${channel}`
         : 'chrome-profile';
 
-    let userDataDir = this.#serverArgs.userDataDir;
+    let userDataDir = this.#config.resolved.userDataDir;
     if (!isolated && !userDataDir) {
       userDataDir = path.join(
         os.homedir(),
@@ -241,7 +243,9 @@ export class BrowserManager {
       });
     }
 
-    const args: LaunchOptions['args'] = [...(this.#serverArgs.chromeArg ?? [])];
+    const args: LaunchOptions['args'] = [
+      ...(this.#config.resolved.chromeArg ?? []),
+    ];
     if (proxyServer) {
       args.push(`--proxy-server=${proxyServer}`);
     }
@@ -345,9 +349,9 @@ export class BrowserManager {
       blockedUrlPattern: blocklist,
       allowedUrlPattern: allowlist,
       categoryExtensions: enableExtensions,
-    } = this.#serverArgs;
+    } = this.#config.resolved;
     // Important: only pass channel, if autoConnect is true.
-    const channel = isAutoConnect ? this.#serverArgs.channel : undefined;
+    const channel = isAutoConnect ? this.#config.resolved.channel : undefined;
 
     const connectOptions: Parameters<typeof puppeteer.connect>[0] = {
       targetFilter: BrowserManager.makeTargetFilter(enableExtensions),
@@ -361,7 +365,7 @@ export class BrowserManager {
       // periodically and terminates it on a missed pong, which rejects the
       // in-flight CDP calls and fires `disconnected` so #evictIfCurrent()
       // drops the stale handle. Without this, such a call would hang until
-      // protocolTimeout while holding the tool mutex.
+      // protocolTimeout inside the context queue.
       wsOptions: {
         keepAlive: true,
         headers: wsHeaders,
@@ -374,8 +378,8 @@ export class BrowserManager {
     } else if (browserURL) {
       connectOptions.browserURL = browserURL;
     } else if (channel || userDataDir) {
+      autoConnect = true;
       if (userDataDir) {
-        autoConnect = true;
         // TODO: re-expose this logic via Puppeteer.
         const portPath = path.join(userDataDir, 'DevToolsActivePort');
         try {

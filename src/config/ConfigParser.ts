@@ -8,8 +8,12 @@ import {readFileSync} from 'node:fs';
 
 import type {Argv} from 'yargs';
 
-import type {YargsOptions, InferredOptionTypes} from '../third_party/cli.js';
-import {yargs, hideBin} from '../third_party/cli.js';
+import {
+  yargs,
+  hideBin,
+  type YargsOptions,
+  type InferredOptionTypes,
+} from '../third_party/cli.js';
 import {getErrorMessage} from '../utils/errorHandling.js';
 
 import {ConfigLocator} from './ConfigLocator.js';
@@ -18,11 +22,9 @@ import {
   CLI_EXAMPLES,
   stripYargsPositionalArgs,
   withoutDefaults,
+  type ParsedArguments,
 } from './mcp-options.js';
-import type {ParsedArguments} from './ServerConfig.js';
 import {ServerConfig} from './ServerConfig.js';
-
-export type {ParsedArguments} from './ServerConfig.js';
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -30,13 +32,14 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 
 export class ConfigParser {
   #configPath?: string;
+  #cliArgs?: Partial<ParsedArguments>;
   #usageStatisticsNoticeShown = false;
   readonly configLocator: ConfigLocator;
 
   constructor(
     private version: string,
-    private argv = process.argv,
-    private env = process.env,
+    private argv: string[] = process.argv,
+    private env: NodeJS.ProcessEnv = process.env,
     private exitProcess = true,
     configLocator?: ConfigLocator,
   ) {
@@ -84,20 +87,27 @@ export class ConfigParser {
    * Step 2: reads the JSON config file and runs it through yargs to reject
    * unknown keys and apply coercions, without applying defaults.
    */
-  parseConfigFile(configPath: string): Partial<ParsedArguments> {
+  static parseConfigFile(
+    configPath: string,
+    rawContent?: string,
+  ): Partial<ParsedArguments> {
     try {
       const fileContent: unknown = JSON.parse(
-        readFileSync(configPath, 'utf-8'),
+        rawContent ?? readFileSync(configPath, 'utf-8'),
       );
       if (!isPlainObject(fileContent)) {
         throw new Error('Config must be a JSON object');
       }
+      const configOptions = withoutDefaults(mcpOptions);
+      delete configOptions.config;
       const parsed = yargs([])
         .parserConfiguration({
           'strip-aliased': true,
           'camel-case-expansion': false,
         })
-        .options(withoutDefaults(mcpOptions))
+        .options(configOptions)
+        .help(false)
+        .version(false)
         .config(fileContent)
         .strict()
         .fail(false)
@@ -107,6 +117,13 @@ export class ConfigParser {
     } catch (err) {
       throw new Error(`Invalid JSON config file: ${getErrorMessage(err)}`);
     }
+  }
+
+  parseConfigFile(
+    configPath: string,
+    rawContent?: string,
+  ): Partial<ParsedArguments> {
+    return ConfigParser.parseConfigFile(configPath, rawContent);
   }
 
   warnUnknownArgs(cliArgs: Partial<ParsedArguments>): void {
@@ -126,6 +143,7 @@ export class ConfigParser {
   parseConfig(): ServerConfig {
     try {
       const cliArgs = this.parseCliArgs();
+      this.#cliArgs = cliArgs;
       this.#configPath = cliArgs.config ?? this.configLocator.locate(this.env);
       this.warnUnknownArgs(cliArgs);
       return this.#resolveConfig(cliArgs);
@@ -149,7 +167,8 @@ export class ConfigParser {
    * instead of exiting the process.
    */
   reloadConfig(): ServerConfig {
-    return this.#resolveConfig(this.parseCliArgs());
+    this.#cliArgs ??= this.parseCliArgs();
+    return this.#resolveConfig(this.#cliArgs);
   }
 
   /**

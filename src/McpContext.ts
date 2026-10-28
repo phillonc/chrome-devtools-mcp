@@ -8,6 +8,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {fileURLToPath, pathToFileURL} from 'node:url';
+import {isDeepStrictEqual} from 'node:util';
 
 import {overrideDevToolsGlobals} from './devtools/DevtoolsUtils.js';
 import type {
@@ -20,10 +21,11 @@ import type {
   HeapQueryOptions,
 } from './processors/HeapSnapshotManager.js';
 import {McpPage} from './McpPage.js';
-import {type UncaughtError} from './collectors/PageCollector.js';
+import type {UncaughtError} from './collectors/PageCollector.js';
 import {ServiceWorkerConsoleCollector} from './collectors/ServiceWorkerCollector.js';
 import {
   Locator,
+  Mutex,
   type Browser,
   type BrowserContext,
   type Connection,
@@ -40,19 +42,24 @@ import {
   type Root,
   type DevTools,
 } from './third_party/index.js';
+import type {ParsedArguments} from './config/mcp-options.js';
 import type {ReadonlyServerConfig} from './config/ServerConfig.js';
-import {CLOSE_PAGE_ERROR} from './tools/ToolDefinition.js';
-import type {
-  BrowserlessContext,
-  Context,
-  DevToolsData,
-  SupportedExtensions,
+import {ToolCategory} from './tools/categories.js';
+import {
+  CLOSE_PAGE_ERROR,
+  isCapabilityEnabled,
+  type BrowserlessContext,
+  type CapabilityGate,
+  type Context,
+  type DevToolsData,
+  type SupportedExtensions,
 } from './tools/ToolDefinition.js';
 import type {TraceResult} from './processors/PerformanceTrace.js';
 import type {Logger} from './types.js';
 import {McpWorker} from './McpWorker.js';
 import {getTempFilePath, resolveCanonicalPath} from './utils/files.js';
 import {escapeForLog} from './utils/logger.js';
+import type {TaskQueue, TaskRunner} from './utils/TaskRunner.js';
 import {isAllowedUrl} from './utils/url.js';
 
 export interface McpContextOptions {
@@ -61,10 +68,67 @@ export interface McpContextOptions {
   navigationTimeout?: number;
   // Shared heap snapshot manager to preserve loaded snapshots across browser reconnects.
   heapSnapshotManager: HeapSnapshotManager;
+  // Creates the context queue and the page queues.
+  taskRunner: TaskRunner;
   // Returns the browser to use. Called by ensureBrowser(), so the browser
   // connection is only established once a tool needs it.
   getBrowser: () => Promise<Browser>;
 }
+
+interface OptionGate {
+  options: ReadonlyArray<keyof ParsedArguments>;
+}
+
+type FeatureController =
+  | {
+      gate: OptionGate;
+      onChange(context: McpContext): Promise<unknown> | void;
+    }
+  | {
+      gate: CapabilityGate;
+      onDisable(context: McpContext): Promise<void> | void;
+    };
+
+function hasOptionChanged(
+  gate: OptionGate,
+  previousArgs: ParsedArguments,
+  nextArgs: ParsedArguments,
+): boolean {
+  return gate.options.some(
+    option => !isDeepStrictEqual(nextArgs[option], previousArgs[option]),
+  );
+}
+
+const FEATURE_CONTROLLERS: readonly FeatureController[] = [
+  {
+    gate: {options: ['blockedUrlPattern', 'allowedUrlPattern']},
+    onChange: context => context.syncNetworkRestrictions(),
+  },
+  {
+    gate: {options: ['sourceMaps']},
+    onChange: context => context.syncSourceMaps(),
+  },
+  {
+    gate: {options: ['experimentalIncludeAllPages']},
+    onChange: context => context.createPagesSnapshot(),
+  },
+  {
+    gate: {category: ToolCategory.DEBUGGING},
+    onDisable: context => context.releaseScreencasts(),
+  },
+  {
+    gate: {category: ToolCategory.MEMORY, conditions: ['memoryDebugging']},
+    onDisable: context => context.releaseHeapSnapshots(),
+  },
+  {
+    gate: {category: ToolCategory.PERFORMANCE},
+    onDisable: context => context.releasePerformanceTrace(),
+  },
+  {
+    gate: {category: ToolCategory.DEBUGGING, conditions: ['devtoolsComments']},
+    onDisable: context => context.releaseDevToolsComments(),
+  },
+];
 
 // Page ids are handed out from a process-wide counter so they stay unique
 // across all contexts, in particular across browser reconnects. An id issued
@@ -93,13 +157,24 @@ export class McpContext implements Context, BrowserlessContext {
   #workers = new Map<Target, McpWorker>();
 
   #mcpPages = new Map<Target, McpPage>();
+  /**
+   * Queue for the browser-wide state (page list, selected page, trace
+   * state). Every page queue is a child of it, so a task on it waits for
+   * every page task and blocks later page tasks.
+   */
+  readonly taskQueue: TaskQueue;
+  #taskRunner: TaskRunner;
+  #pageTaskQueues = new Map<number, TaskQueue>();
+  /**
+   * Serializes `createPagesSnapshot()`. Two tasks on different page queues
+   * can call it at the same time.
+   */
+  #pagesSnapshotMutex = new Mutex();
   #selectedPage?: McpPage;
   #selectedPageFallback?: {wasClosed: boolean};
   #selectedPageFallbackRead = false;
 
   #serviceWorkerConsoleCollector?: ServiceWorkerConsoleCollector;
-
-  #isRunningTrace = false;
 
   #reconnectNotice = false;
 
@@ -124,6 +199,8 @@ export class McpContext implements Context, BrowserlessContext {
 
     this.logger = logger;
     this.#locatorClass = locatorClass;
+    this.#taskRunner = options.taskRunner;
+    this.taskQueue = options.taskRunner.createQueue();
     this.#config = options.config;
     this.#options = options;
     this.#heapSnapshotManager = options.heapSnapshotManager;
@@ -146,6 +223,121 @@ export class McpContext implements Context, BrowserlessContext {
       pages.add(this.#selectedPage);
     }
     return pages;
+  }
+
+  /**
+   * Synchronizes browser/page state and releases state of capabilities that
+   * transitioned from enabled to disabled after a config reload.
+   */
+  async onConfigChanged(previousArgs: ParsedArguments): Promise<void> {
+    const nextArgs = this.#config.resolved;
+    for (const controller of FEATURE_CONTROLLERS) {
+      if ('onChange' in controller) {
+        if (hasOptionChanged(controller.gate, previousArgs, nextArgs)) {
+          await controller.onChange(this);
+        }
+      } else if (
+        isCapabilityEnabled(controller.gate, previousArgs) &&
+        !isCapabilityEnabled(controller.gate, nextArgs)
+      ) {
+        await controller.onDisable(this);
+      }
+    }
+  }
+
+  /**
+   * Applies updated URL allowlist/blocklist rules to the connected browser and
+   * clears incompatible page network throttling state.
+   */
+  async syncNetworkRestrictions(): Promise<void> {
+    const {blockedUrlPattern, allowedUrlPattern} = this.#config.resolved;
+    if (blockedUrlPattern || allowedUrlPattern) {
+      for (const mcpPage of this.#allMcpPages()) {
+        await mcpPage.clearNetworkConditions();
+      }
+    }
+    if (this.#browser) {
+      await this.#browser.restrictNetwork({
+        blocklist: blockedUrlPattern,
+        allowlist: allowedUrlPattern,
+      });
+    }
+  }
+
+  /**
+   * Synchronizes the DevTools source maps setting across all pages.
+   */
+  syncSourceMaps(): void {
+    for (const mcpPage of this.#allMcpPages()) {
+      mcpPage.syncSourceMaps();
+    }
+  }
+
+  /**
+   * Stops and saves active screencast recordings across all pages when
+   * screencast tools are disabled.
+   */
+  async releaseScreencasts(): Promise<void> {
+    for (const mcpPage of this.#allMcpPages()) {
+      const screenRecorderData = mcpPage.getScreenRecorder();
+      if (!screenRecorderData) {
+        continue;
+      }
+      const {recorder, filePath} = screenRecorderData;
+      mcpPage.setScreenRecorder(null);
+      try {
+        await recorder.stop();
+        this.logger?.(
+          `The screencast recording was stopped and saved to ${filePath} because screencast tools were disabled.`,
+        );
+      } catch (err) {
+        this.logger?.('Failed to stop the screencast recording', err);
+      }
+    }
+  }
+
+  /**
+   * Closes all loaded heap snapshots when memory tools are disabled.
+   */
+  releaseHeapSnapshots(): void {
+    if (this.#heapSnapshotManager.hasSnapshots()) {
+      this.#heapSnapshotManager.dispose();
+      this.logger?.(
+        'Loaded heap snapshots were closed because memory tools were disabled.',
+      );
+    }
+  }
+
+  /**
+   * Discards recorded performance traces and stops any running trace when
+   * performance tools are disabled.
+   */
+  async releasePerformanceTrace(): Promise<void> {
+    this.#traceResults = [];
+    for (const mcpPage of this.#allMcpPages()) {
+      if (!mcpPage.isRunningPerformanceTrace()) {
+        continue;
+      }
+      mcpPage.setIsRunningPerformanceTrace(false);
+      try {
+        await mcpPage.pptrPage.tracing.stop();
+      } catch (err) {
+        this.logger?.('Failed to stop the performance trace', err);
+      }
+      this.logger?.(
+        'The running performance trace was discarded because performance tools were disabled.',
+      );
+    }
+  }
+
+  /**
+   * Disposes DevTools comment bridges across all pages when DevTools comment
+   * tools are disabled.
+   */
+  releaseDevToolsComments(): void {
+    for (const mcpPage of this.#allMcpPages()) {
+      mcpPage.disposeCommentBridge();
+    }
   }
 
   /**
@@ -209,7 +401,7 @@ export class McpContext implements Context, BrowserlessContext {
 
     this.#serviceWorkerConsoleCollector?.dispose();
     for (const mcpPage of this.#allMcpPages()) {
-      mcpPage.dispose();
+      this.#disposeMcpPage(mcpPage);
     }
     this.#mcpPages.clear();
     this.#workers.clear();
@@ -221,7 +413,6 @@ export class McpContext implements Context, BrowserlessContext {
     this.#selectedPage = undefined;
     this.#selectedPageFallback = undefined;
     this.#selectedPageFallbackRead = false;
-    this.#isRunningTrace = false;
     this.#traceResults = [];
     this.#serviceWorkerConsoleCollector = undefined;
     this.#browser = undefined;
@@ -247,7 +438,7 @@ export class McpContext implements Context, BrowserlessContext {
     try {
       const mcpPage = this.#mcpPages.get(target);
       if (mcpPage) {
-        mcpPage.dispose();
+        this.#disposeMcpPage(mcpPage);
         this.#mcpPages.delete(target);
       }
       this.#workers.delete(target);
@@ -346,9 +537,14 @@ export class McpContext implements Context, BrowserlessContext {
 
       if (result.status === 'fulfilled') {
         const canonicalRoot = result.value;
+        // A filesystem root such as `/` or `C:\` already ends with the
+        // separator; appending another one would match no path below it.
+        const rootPrefix = canonicalRoot.endsWith(path.sep)
+          ? canonicalRoot
+          : canonicalRoot + path.sep;
         if (
           canonicalPath === canonicalRoot ||
-          canonicalPath.startsWith(canonicalRoot + path.sep)
+          canonicalPath.startsWith(rootPrefix)
         ) {
           allowed = true;
           break;
@@ -402,7 +598,7 @@ export class McpContext implements Context, BrowserlessContext {
       page = await this.browser.newPage({background});
     }
     const mcpPage = this.#createMcpPage(page.target());
-    await mcpPage.init();
+    await mcpPage.init({emulateFocus: true});
     this.selectPage(mcpPage);
     await this.createPagesSnapshot();
     return mcpPage;
@@ -452,12 +648,13 @@ export class McpContext implements Context, BrowserlessContext {
     return this.browser.getPWAState(options);
   }
 
-  setIsRunningPerformanceTrace(x: boolean): void {
-    this.#isRunningTrace = x;
-  }
-
   isRunningPerformanceTrace(): boolean {
-    return this.#isRunningTrace;
+    for (const mcpPage of this.#allMcpPages()) {
+      if (mcpPage.isRunningPerformanceTrace()) {
+        return true;
+      }
+    }
+    return false;
   }
 
   isCruxEnabled(): boolean {
@@ -552,6 +749,28 @@ export class McpContext implements Context, BrowserlessContext {
     return page;
   }
 
+  /**
+   * The queue for tasks on page `pageId`. The queue exists before the page
+   * does, so a tool call can enter it before the browser connects. It is a
+   * child of {@link taskQueue}.
+   */
+  pageTaskQueue(pageId: number): TaskQueue {
+    let queue = this.#pageTaskQueues.get(pageId);
+    if (!queue) {
+      queue = this.#taskRunner.createQueue(this.taskQueue);
+      this.#pageTaskQueues.set(pageId, queue);
+    }
+    return queue;
+  }
+
+  #disposeMcpPage(mcpPage: McpPage): void {
+    mcpPage.dispose();
+    this.#pageTaskQueues
+      .get(mcpPage.id)
+      ?.dispose(new Error(`Page ${mcpPage.id} is closed.`));
+    this.#pageTaskQueues.delete(mcpPage.id);
+  }
+
   isPageSelected(page: McpPage): boolean {
     return this.#selectedPage === page;
   }
@@ -568,7 +787,7 @@ export class McpContext implements Context, BrowserlessContext {
       this.#selectedPage !== newPage &&
       !this.#mcpPages.has(this.#selectedPage.target)
     ) {
-      this.#selectedPage.dispose();
+      this.#disposeMcpPage(this.#selectedPage);
     }
     this.#selectedPage = newPage;
     newPage.updateTimeouts();
@@ -668,6 +887,10 @@ export class McpContext implements Context, BrowserlessContext {
   }
 
   async createPagesSnapshot(): Promise<McpPage[]> {
+    if (!this.#browser) {
+      return [];
+    }
+    using guard = await this.#pagesSnapshotMutex.acquire();
     const allTargets = this.#fetchPageTargets();
 
     for (const target of allTargets) {
@@ -679,7 +902,7 @@ export class McpContext implements Context, BrowserlessContext {
     for (const [target, mcpPage] of this.#mcpPages) {
       if (!currentTargets.has(target)) {
         if (mcpPage !== this.#selectedPage || mcpPage.isClosed()) {
-          mcpPage.dispose();
+          this.#disposeMcpPage(mcpPage);
         }
         this.#mcpPages.delete(target);
       }
@@ -687,26 +910,42 @@ export class McpContext implements Context, BrowserlessContext {
 
     const pages = Array.from(this.#mcpPages.values());
 
-    // Only fall back when the selected page is actually gone. Gating on
-    // `isClosed()` instead of `pages` membership avoids silently swapping a
-    // live page that is momentarily missing from the snapshot.
+    // Only fall back when the selected page is actually gone or no longer
+    // counts as a page, e.g. a background page after
+    // experimentalIncludeAllPages was turned off. Gating on `isClosed()`
+    // instead of `pages` membership avoids silently swapping a live page that
+    // is momentarily missing from the snapshot.
     if (this.#selectedPageFallbackRead) {
       this.#selectedPageFallback = undefined;
       this.#selectedPageFallbackRead = false;
     }
-    if ((!this.#selectedPage || this.#selectedPage.isClosed()) && pages[0]) {
-      // Record the automatic change so the response can surface it. Skipped on
-      // first connect, when there was no prior selection to replace.
-      if (this.#selectedPage) {
-        this.#selectedPageFallback = {
-          wasClosed: this.#selectedPage.isClosed(),
-        };
+    if (
+      !this.#selectedPage ||
+      this.#selectedPage.isClosed() ||
+      !this.#isPageTarget(this.#selectedPage.target)
+    ) {
+      if (pages[0]) {
+        // Record the automatic change so the response can surface it. Skipped on
+        // first connect, when there was no prior selection to replace.
+        if (this.#selectedPage) {
+          this.#selectedPageFallback = {
+            wasClosed: this.#selectedPage.isClosed(),
+          };
+        }
+        this.#selectPage(pages[0]);
+      } else if (this.#selectedPage) {
+        const wasClosed = Boolean(this.#selectedPage.isClosed());
+        if (!wasClosed) {
+          this.#disposeMcpPage(this.#selectedPage);
+        }
+        this.#selectedPage = undefined;
+        this.#selectedPageFallback = {wasClosed};
       }
-      this.#selectPage(pages[0]);
     }
 
     if (this.#selectedPage && !this.#selectedPage.isClosed()) {
-      await this.#selectedPage.init();
+      // Automatic page snapshots must preserve real focus on untouched tabs.
+      await this.#selectedPage.init({emulateFocus: false});
     }
 
     return pages;

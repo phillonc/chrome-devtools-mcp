@@ -10,17 +10,17 @@ import {before, describe, it} from 'node:test';
 
 import type {Dialog} from 'puppeteer-core';
 
-import type {ParsedArguments} from '../../src/config/ConfigParser.js';
+import type {ParsedArguments} from '../../src/config/mcp-options.js';
 import {loadIssueDescriptions} from '../../src/devtools/issueDescriptions.js';
 import {McpResponse} from '../../src/McpResponse.js';
 import {TextSnapshot} from '../../src/TextSnapshot.js';
-import type {CdpWebWorker} from '../../src/third_party/index.js';
-import {DevTools} from '../../src/third_party/index.js';
+import {DevTools, type CdpWebWorker} from '../../src/third_party/index.js';
 import {
   getConsoleMessage,
   listConsoleMessages,
 } from '../../src/tools/console.js';
 import {installExtension} from '../../src/tools/extensions.js';
+import {createMockParsedArguments, createMockServerConfig} from '../mocks.js';
 import {serverHooks} from '../server.js';
 import {
   getTextContent,
@@ -62,7 +62,7 @@ describe('console', () => {
         const sw = swList.find(s => s.target === swTarget);
         assert(sw, 'Service worker not found in context list');
 
-        const response2 = new McpResponse(args);
+        const response2 = new McpResponse(createMockServerConfig(args));
 
         await context.triggerExtensionAction(extensionId);
         const worker = await swTarget.worker();
@@ -142,6 +142,24 @@ describe('console', () => {
   });
 
   describe('list_console_messages', () => {
+    it('describes the default preserved navigation history', () => {
+      const tool = listConsoleMessages(createMockParsedArguments());
+      assert.strictEqual(
+        tool.schema.includePreservedMessages.description,
+        'Set to true to return the preserved messages over the last 3 navigations.',
+      );
+    });
+
+    it('describes preserved messages using maxNavigationSaved', () => {
+      const tool = listConsoleMessages(
+        createMockParsedArguments({maxNavigationSaved: 5}),
+      );
+      assert.strictEqual(
+        tool.schema.includePreservedMessages.description,
+        'Set to true to return the preserved messages over the last 5 navigations.',
+      );
+    });
+
     it('list messages', async () => {
       await withMcpContext(async (response, context, args) => {
         await listConsoleMessages(args).handler(
@@ -267,7 +285,7 @@ describe('console', () => {
         // setContent resolves, so poll until the collector has all three.
         let textContent = '';
         await waitExecutionFor(async () => {
-          const pollResponse = new McpResponse(args);
+          const pollResponse = new McpResponse(createMockServerConfig(args));
           pollResponse.setPage(page);
           await listConsoleMessages(args).handler(
             {params: {}, page},
@@ -465,7 +483,7 @@ describe('console', () => {
             response,
             context,
           );
-          const response2 = new McpResponse(args);
+          const response2 = new McpResponse(createMockServerConfig(args));
           response2.setPage(context.getSelectedMcpPage());
           await getConsoleMessage(args).handler(
             {params: {msgid: 1}, page: context.getSelectedMcpPage()},
@@ -521,7 +539,7 @@ describe('console', () => {
             response,
             context,
           );
-          const response2 = new McpResponse(args);
+          const response2 = new McpResponse(createMockServerConfig(args));
           response2.setPage(context.getSelectedMcpPage());
           await getConsoleMessage(args).handler(
             {params: {msgid: id}, page: context.getSelectedMcpPage()},

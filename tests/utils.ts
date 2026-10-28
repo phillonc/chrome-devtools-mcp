@@ -17,25 +17,26 @@ import type {TestContext} from 'node:test';
 import type {Browser} from 'puppeteer';
 import puppeteer, {Locator} from 'puppeteer';
 
-import type {CallToolResult} from '../src/third_party/index.js';
 import type {
   Frame,
   HTTPRequest,
   HTTPResponse,
   LaunchOptions,
   Page,
+  Protocol,
   Target,
 } from 'puppeteer-core';
 import sinon from 'sinon';
 
-import type {ParsedArguments} from '../src/config/ConfigParser.js';
+import type {ParsedArguments} from '../src/config/mcp-options.js';
 import {stopDaemon} from '../src/daemon/client.js';
 import {isDaemonRunning} from '../src/daemon/utils.js';
 import {McpContext, type McpContextOptions} from '../src/McpContext.js';
 import {McpResponse} from '../src/McpResponse.js';
 import {HeapSnapshotManager} from '../src/processors/HeapSnapshotManager.js';
+import {TaskRunner} from '../src/utils/TaskRunner.js';
 import {TextSnapshot} from '../src/TextSnapshot.js';
-import {DevTools} from '../src/third_party/index.js';
+import {DevTools, type CallToolResult} from '../src/third_party/index.js';
 import {stableIdSymbol} from '../src/utils/id.js';
 
 import {
@@ -46,11 +47,14 @@ import {
   stripUndefined,
 } from './mocks.js';
 
-export function assertNoServiceWorkerReported(targets: Target[], id: string) {
+export function assertNoServiceWorkerReported(
+  targets: Target[],
+  id: string,
+): void {
   const target = targets.find(target => {
     return target.url().includes(id) && target.type() === 'service_worker';
   });
-  assert(target === undefined);
+  assert.strictEqual(target, undefined);
 }
 
 export function getTextContent(
@@ -72,7 +76,7 @@ export function getImageContent(content: CallToolResult['content'][number]): {
   throw new Error(`Expected image content but got ${content.type}`);
 }
 
-export function extractExtensionId(response: McpResponse) {
+export function extractExtensionId(response: McpResponse): string {
   const responseLine = response.responseLines[0];
   assert.ok(responseLine, 'Response should not be empty');
   const match = responseLine.match(/Extension installed\. Id: (.+)/);
@@ -94,7 +98,7 @@ export async function withBrowser(
     blockedUrlPattern?: string[];
     allowedUrlPattern?: string[];
   } = {},
-) {
+): Promise<void> {
   let attempt = 1;
   while (attempt <= 3) {
     const launchOptions: LaunchOptions = {
@@ -177,12 +181,18 @@ export async function withBrowser(
  */
 export async function createConnectedMcpContext(
   browser: Browser,
-  options: Omit<McpContextOptions, 'getBrowser'>,
+  options: Omit<McpContextOptions, 'getBrowser' | 'taskRunner'> & {
+    taskRunner?: TaskRunner;
+  },
   locatorClass?: typeof Locator,
 ): Promise<McpContext> {
   const context = McpContext.create(
     undefined,
-    {...options, getBrowser: async () => browser},
+    {
+      taskRunner: new TaskRunner(),
+      ...options,
+      getBrowser: async () => browser,
+    },
     locatorClass,
   );
   await context.ensureBrowser();
@@ -208,7 +218,7 @@ export async function withMcpContext(
     navigationTimeout?: number;
   } = {},
   args: Partial<ParsedArguments> = {},
-) {
+): Promise<void> {
   await withBrowser(async browser => {
     TextSnapshot.resetCounter();
     McpContext.resetPageIdsForTesting();
@@ -224,8 +234,8 @@ export async function withMcpContext(
         allowUnrestrictedPaths: options.allowUnrestrictedPaths,
       }),
     });
-    const response = new McpResponse(parsedArgs);
-    const heapSnapshotManager = new HeapSnapshotManager();
+    const response = new McpResponse(serverConfig);
+    const heapSnapshotManager = new HeapSnapshotManager(new TaskRunner());
     if (context) {
       context.dispose();
     }
@@ -268,6 +278,7 @@ export function getMockRequest(
     frame?: Frame;
     redirectChain?: HTTPRequest[];
     headers?: Record<string, string>;
+    initiator?: Protocol.Network.Initiator;
   } = {},
 ): HTTPRequest {
   return {
@@ -313,6 +324,9 @@ export function getMockRequest(
     },
     frame() {
       return options.frame ?? ({} as Frame);
+    },
+    initiator() {
+      return options.initiator;
     },
     [stableIdSymbol]: options.stableId ?? 1,
   } as unknown as HTTPRequest;
@@ -383,7 +397,7 @@ export function stabilizeStructuredContent(content: unknown): string {
   return JSON.stringify(stabilize(content), null, 2);
 }
 
-export function stabilizeResponseOutput(text: unknown) {
+export function stabilizeResponseOutput(text: unknown): string {
   if (typeof text !== 'string') {
     throw new Error('Input must be string');
   }
@@ -460,7 +474,9 @@ export function getMockBrowser(options?: {
   } as Browser;
 }
 
-export const CLI_PATH = path.resolve('build/src/bin/chrome-devtools.js');
+export const CLI_PATH: string = path.resolve(
+  'build/src/bin/chrome-devtools.js',
+);
 
 export async function runCli(
   args: string[],
@@ -492,7 +508,9 @@ export async function runCli(
   });
 }
 
-export async function assertDaemonIsNotRunning(sessionId?: string) {
+export async function assertDaemonIsNotRunning(
+  sessionId?: string,
+): Promise<void> {
   const result = await runCli(['status'], sessionId);
   assert.strictEqual(
     result.stdout,
@@ -504,7 +522,7 @@ export async function assertDaemonIsNotRunning(sessionId?: string) {
  * Stops the daemon in-process. Use it for test cleanup: it does not spawn
  * a CLI process, which takes about a second per call.
  */
-export async function stopDaemonForCleanup(sessionId: string) {
+export async function stopDaemonForCleanup(sessionId: string): Promise<void> {
   await stopDaemon(sessionId);
   assert.ok(!isDaemonRunning(sessionId), 'daemon is still running');
 }
@@ -521,7 +539,7 @@ export function createCliSession(t: TestContext): string {
   return sessionId;
 }
 
-export async function assertDaemonIsRunning(sessionId?: string) {
+export async function assertDaemonIsRunning(sessionId?: string): Promise<void> {
   const result = await runCli(['status'], sessionId);
   assert.ok(
     result.stdout.startsWith('chrome-devtools-mcp daemon is running.\n'),
@@ -532,7 +550,7 @@ export async function assertDaemonIsRunning(sessionId?: string) {
 export async function waitExecutionFor(
   func: () => Promise<void>,
   timeout: number,
-) {
+): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < 10000) {
     try {
@@ -548,12 +566,15 @@ export async function waitExecutionFor(
 
 export function createTempDir(
   prefix = 'chrome-devtools-test-',
-  baseDir = os.tmpdir(),
-) {
+  baseDir: string = os.tmpdir(),
+): {
+  path: string;
+  [Symbol.dispose]: () => void;
+} {
   const dirPath = fs.mkdtempSync(path.join(baseDir, prefix));
   return {
     path: dirPath,
-    [Symbol.dispose]() {
+    [Symbol.dispose](): void {
       try {
         fs.rmSync(dirPath, {recursive: true, force: true});
       } catch {
@@ -566,8 +587,11 @@ export function createTempDir(
 export function createTempFile(
   content: string,
   fileName: string,
-  baseDir = os.tmpdir(),
-) {
+  baseDir: string = os.tmpdir(),
+): {
+  path: string;
+  [Symbol.dispose]: () => void;
+} {
   const dirPath = fs.mkdtempSync(
     path.join(baseDir, 'chrome-devtools-test-file-'),
   );
@@ -575,7 +599,7 @@ export function createTempFile(
   fs.writeFileSync(filePath, content);
   return {
     path: filePath,
-    [Symbol.dispose]() {
+    [Symbol.dispose](): void {
       try {
         fs.rmSync(dirPath, {recursive: true, force: true});
       } catch {

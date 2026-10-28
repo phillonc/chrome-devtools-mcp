@@ -4,7 +4,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import type {ParsedArguments} from '../config/ConfigParser.js';
+import {categoryToFlagName} from '../config/category-options.js';
+import type {ParsedArguments} from '../config/mcp-options.js';
 import type {
   HeapSnapshotAggregateData,
   HeapSnapshotDiff,
@@ -20,23 +21,25 @@ import type {
   ContextFilterOptions,
   HeapSnapshotFormatOptions,
 } from '../formatters/HeapSnapshotFormatter.js';
-import {zod} from '../third_party/index.js';
-import type {
-  Dialog,
-  ElementHandle,
-  Extension,
-  GetPWAStateOptions,
-  InstallPWAOptions,
-  LaunchPWAOptions,
-  PWAState,
-  ScreenRecorder,
-  ScreenRecording,
-  UninstallPWAOptions,
-  Viewport,
-  DevTools,
-  Protocol,
-  Page,
-  WebMCPTool,
+import {
+  zod,
+  type Dialog,
+  type ElementHandle,
+  type Extension,
+  type GetPWAStateOptions,
+  type InstallPWAOptions,
+  type LaunchPWAOptions,
+  type PWAState,
+  type ScreenRecorder,
+  type ScreenRecording,
+  type UninstallPWAOptions,
+  type Viewport,
+  type DevTools,
+  type Flags,
+  type Protocol,
+  type Page,
+  type RunnerResult,
+  type WebMCPTool,
 } from '../third_party/index.js';
 import type {InsightName, TraceResult} from '../processors/PerformanceTrace.js';
 import type {
@@ -75,34 +78,56 @@ export type FileVerificationOption =
       allowUrl?: boolean;
     };
 
+/**
+ * Which task queue `ToolHandler` runs a tool call on. A task on a queue
+ * waits for tasks on the same queue, on its parent, and on its children.
+ *
+ * - `'exclusive'`: the context queue, for the whole call. No other browser
+ *   tool runs at the same time. For every tool that touches browser-global
+ *   state or that is not reviewed for page-only access.
+ * - `'page'`: the queue of the page named by `pageId`, a child of the
+ *   context queue. Tools on different pages run at the same time; tools on
+ *   one page and `'exclusive'` tools wait. Without page id routing the call
+ *   runs on the context queue. Only for page-scoped tools whose handler
+ *   touches the target page and no browser-global state.
+ * - `'none'`: no queue. The tool runs at the same time as any other tool.
+ *   For browserless tools, whose data guards itself (see
+ *   `HeapSnapshotManager`), and for page tools that only read page state
+ *   and wait for external events.
+ */
+export type ToolConcurrency = 'exclusive' | 'page' | 'none';
+
 type AllKeys<T> = T extends unknown ? keyof T : never;
 
-type ExtractSchemaField<Schema, K extends PropertyKey> = Schema extends unknown
+type SchemaField<Schema, K extends PropertyKey> = Schema extends unknown
   ? K extends keyof Schema
-    ? Exclude<Schema[K], undefined>
-    : never
+    ? Schema[K]
+    : undefined
   : never;
 
-export type MergeSchema<Schema extends zod.ZodRawShape> = {
-  [K in AllKeys<Schema>]: K extends keyof Schema
-    ? undefined extends Schema[K]
-      ? zod.ZodOptional<ExtractSchemaField<Schema, K>>
-      : Schema[K]
-    : zod.ZodOptional<ExtractSchemaField<Schema, K>>;
+export type ToolSchema = Record<string, zod.ZodType>;
+
+type MergeSchema<Schema extends ToolSchema> = {
+  [K in AllKeys<Schema>]: undefined extends SchemaField<Schema, K>
+    ? zod.ZodOptional<Exclude<SchemaField<Schema, K>, undefined>>
+    : SchemaField<Schema, K>;
 };
 
-export interface BaseToolDefinition<
-  Schema extends zod.ZodRawShape = zod.ZodRawShape,
-> {
+export interface CapabilityGate {
+  category?: ToolCategory;
+  conditions?: Array<keyof ParsedArguments>;
+}
+
+export interface BaseToolDefinition<Schema extends ToolSchema = ToolSchema> {
   name: string;
   description: string;
   annotations: {
-    title?: string;
     category: ToolCategory;
     /**
      * If true, the tool does not modify its environment.
      */
     readOnlyHint: boolean;
+    title?: string;
     /**
      * If `'slim'` is included, the tool is only available with `--slim`. Tools
      * without `'slim'` are only available without `--slim`, see
@@ -113,26 +138,26 @@ export interface BaseToolDefinition<
   schema: Schema;
   blockedByDialog: boolean;
   /**
-   * When true, the handler runs without the server tool lock, so other tool
-   * calls proceed while this handler waits. Page lookup before the handler
-   * and response formatting after it still run under the lock. Only set
-   * this for tools that wait for external events.
+   * Which task queue the server holds while the tool runs. See
+   * {@link ToolConcurrency}.
    */
-  yieldsToolLock?: boolean;
-  verifyFilesSchema: Partial<
-    Record<keyof MergeSchema<Schema>, FileVerificationOption>
-  >;
+  concurrency: ToolConcurrency;
+  verifyFilesSchema: Partial<Record<AllKeys<Schema>, FileVerificationOption>>;
 }
 
 export interface ToolDefinition<
-  Schema extends zod.ZodRawShape = zod.ZodRawShape,
+  Schema extends ToolSchema = ToolSchema,
 > extends BaseToolDefinition<Schema> {
-  schema: Schema;
   /**
    * Only page-scoped tools are checked for open dialogs by ToolHandler, so a
    * non-page tool must handle dialogs itself.
    */
   blockedByDialog: false;
+  /**
+   * A non-page tool has no target page, so it cannot take the page queue. It
+   * touches browser state, so it always runs in a queue.
+   */
+  concurrency: Exclude<ToolConcurrency, 'page' | 'none'>;
   handler(
     request: Request<Schema>,
     response: Response,
@@ -140,12 +165,8 @@ export interface ToolDefinition<
   ): Promise<void>;
 }
 
-export type SchemaType<T extends zod.ZodRawShape> = zod.output<
-  zod.ZodObject<MergeSchema<T>>
->;
-
-export interface Request<Schema extends zod.ZodRawShape> {
-  params: SchemaType<Schema>;
+export interface Request<Schema extends ToolSchema> {
+  params: zod.output<zod.ZodObject<MergeSchema<Schema>>>;
 }
 
 export interface ImageContentData {
@@ -190,7 +211,6 @@ export interface LighthouseData {
   summary: {
     mode: string;
     device: string;
-    url?: string;
     scores: Array<{
       id: string;
       title: string;
@@ -203,6 +223,7 @@ export interface LighthouseData {
     timing: {
       total: number;
     };
+    url?: string;
   };
   failedAudits: LighthouseFailedAudit[];
   reports: string[];
@@ -289,6 +310,9 @@ export interface Response {
     options?: {requestFilePath?: string; responseFilePath?: string},
   ): void;
   attachConsoleMessage(msgid: number): void;
+  attachWebAuthnAuthenticator(
+    authenticator: WebAuthnAuthenticatorState | undefined,
+  ): void;
   // Allows re-using DevTools data queried by some tools.
   attachDevToolsData(data: DevToolsData): void;
   setTabId(tabId: string): void;
@@ -336,7 +360,6 @@ export type Context = Readonly<{
     extension: Extension,
   ): Promise<`${string}${Extension}`>;
   isRunningPerformanceTrace(): boolean;
-  setIsRunningPerformanceTrace(x: boolean): void;
   isCruxEnabled(): boolean;
   recordedTraces(): TraceResult[];
   storeTraceRecording(result: TraceResult): void;
@@ -445,17 +468,48 @@ export type BrowserlessContext = Readonly<{
 
 export type MatchedStyles = DevTools.CSSMatchedStyles.CSSMatchedStyles;
 
+export type WebAuthnProtocol = 'ctap2' | 'u2f';
+export type WebAuthnTransport = 'internal' | 'usb' | 'nfc' | 'ble' | 'hybrid';
+
+export interface WebAuthnAuthenticatorConfig {
+  enabled: boolean;
+  protocol?: WebAuthnProtocol;
+  transport?: WebAuthnTransport;
+  hasResidentKey?: boolean;
+  hasUserVerification?: boolean;
+  isUserVerified?: boolean;
+}
+
+export interface WebAuthnAuthenticatorState {
+  protocol: WebAuthnProtocol;
+  transport: WebAuthnTransport;
+  hasResidentKey: boolean;
+  hasUserVerification: boolean;
+  isUserVerified: boolean;
+  credentials: Array<{
+    credentialId: string;
+    rpId?: string;
+    isResidentCredential: boolean;
+    userName?: string;
+    signCount: number;
+  }>;
+}
+
 /**
  * Only add methods used by tools/*.
  */
 export type ContextPage = Readonly<{
+  readonly id: number;
   readonly pptrPage: Page;
   readonly cpuThrottlingRate: number;
   readonly networkConditions: string | null;
-  init(): Promise<void>;
+  init(options?: {emulateFocus?: boolean}): Promise<void>;
   getAXNodeByUid(uid: string): TextSnapshotNode | undefined;
   getElementByUid(uid: string): Promise<ElementHandle<Element>>;
   getMatchedStylesForUid(uid: string): Promise<MatchedStyles>;
+  configureWebAuthn(
+    config: WebAuthnAuthenticatorConfig,
+  ): Promise<WebAuthnAuthenticatorState | undefined>;
 
   /**
    * Returns a reqid for a cdpRequestId.
@@ -470,8 +524,10 @@ export type ContextPage = Readonly<{
   getDialog(): Dialog | undefined;
   clearDialog(): void;
   throwIfDialogOpen(): void;
+  isClosed(): boolean;
   getScreenRecorder(): ScreenRecorderData | null;
   setScreenRecorder(data: ScreenRecorderData | null): void;
+  setIsRunningPerformanceTrace(x: boolean): void;
   waitForEventsAfterAction(
     action: (signal: AbortSignal) => Promise<unknown>,
     options?: {
@@ -502,23 +558,37 @@ export type ContextPage = Readonly<{
     prefersReducedMotion?: PrefersReducedMotion | 'auto';
     viewport?: Viewport;
   }): Promise<void>;
-  waitForTextOnPage(text: string[], timeout?: number): Promise<Element>;
+  waitForTextOnPage(
+    text: string[],
+    options?: {timeout?: number; visible?: boolean},
+  ): Promise<Element>;
   getDevToolsPage(): Promise<Page | undefined>;
   openDevTools(): Promise<Page | undefined>;
   ensureDevToolsCommentBridge(
     devtoolsPage: Page,
   ): Promise<DevToolsCommentBridge | undefined>;
+  lighthouseNavigation(flags?: Flags): Promise<RunnerResult | undefined>;
+  lighthouseSnapshot(flags?: Flags): Promise<RunnerResult | undefined>;
 }>;
 
-export function defineTool<Schema extends zod.ZodRawShape>(
-  definition: (args: ParsedArguments) => ToolDefinition<Schema>,
-): (args: ParsedArguments) => ToolDefinition<Schema> {
+export type ToolFactory<Schema extends ToolSchema = ToolSchema> = (
+  args: ParsedArguments,
+) => ToolDefinition<Schema>;
+
+export function defineTool<Schema extends ToolSchema>(
+  definition: ToolFactory<Schema>,
+): ToolFactory<Schema> {
   return definition;
 }
 
 interface PageToolDefinition<
-  Schema extends zod.ZodRawShape = zod.ZodRawShape,
+  Schema extends ToolSchema = ToolSchema,
 > extends BaseToolDefinition<Schema> {
+  /**
+   * A page tool with `'none'` must only read page state. Its page lookup and
+   * response formatting run at the same time as other tools on the page.
+   */
+  concurrency: ToolConcurrency;
   handler(
     request: Request<Schema> & {page: ContextPage},
     response: Response,
@@ -526,20 +596,19 @@ interface PageToolDefinition<
   ): Promise<void>;
 }
 
-export type DefinedPageTool<Schema extends zod.ZodRawShape = zod.ZodRawShape> =
-  Omit<PageToolDefinition<Schema>, 'schema'> & {
-    schema: Schema & Partial<typeof pageIdSchema>;
-    pageScoped: true;
-    handler(
-      request: Request<Schema> & {page: ContextPage},
-      response: Response,
-      context: Context,
-    ): Promise<void>;
-  };
+export interface DefinedPageTool<
+  Schema extends ToolSchema = ToolSchema,
+> extends PageToolDefinition<Schema> {
+  pageScoped: true;
+}
 
-export function definePageTool<Schema extends zod.ZodRawShape>(
+export type PageToolFactory<Schema extends ToolSchema = ToolSchema> = (
+  args: ParsedArguments,
+) => DefinedPageTool<Schema>;
+
+export function definePageTool<Schema extends ToolSchema>(
   definition: (args: ParsedArguments) => PageToolDefinition<Schema>,
-): (args: ParsedArguments) => DefinedPageTool<Schema> {
+): PageToolFactory<Schema> {
   return (args: ParsedArguments): DefinedPageTool<Schema> => {
     const tool = definition(args);
     return {
@@ -554,7 +623,7 @@ export function definePageTool<Schema extends zod.ZodRawShape>(
 }
 
 export interface BrowserlessToolDefinition<
-  Schema extends zod.ZodRawShape = zod.ZodRawShape,
+  Schema extends ToolSchema = ToolSchema,
 > extends BaseToolDefinition<Schema> {
   browserless: true;
   /**
@@ -562,6 +631,10 @@ export interface BrowserlessToolDefinition<
    * dialogs.
    */
   blockedByDialog: false;
+  /**
+   * A browserless tool has no page. `defineBrowserlessTool` sets `'none'`.
+   */
+  concurrency: Exclude<ToolConcurrency, 'page'>;
   handler(
     request: Request<Schema>,
     response: Response,
@@ -569,17 +642,25 @@ export interface BrowserlessToolDefinition<
   ): Promise<void>;
 }
 
+export type BrowserlessToolFactory<Schema extends ToolSchema = ToolSchema> = (
+  args: ParsedArguments,
+) => BrowserlessToolDefinition<Schema>;
+
 /**
  * Defines a tool that does not need a browser connection, e.g. a tool that only
  * analyzes local files. Its handler only receives a {@link BrowserlessContext}.
+ * Such a tool runs without the context queue (`concurrency: 'none'`) unless
+ * the definition sets another value.
  */
-export function defineBrowserlessTool<Schema extends zod.ZodRawShape>(
+export function defineBrowserlessTool<Schema extends ToolSchema>(
   definition: (
     args: ParsedArguments,
-  ) => Omit<BrowserlessToolDefinition<Schema>, 'browserless'>,
-): (args: ParsedArguments) => BrowserlessToolDefinition<Schema> {
+  ) => Omit<BrowserlessToolDefinition<Schema>, 'browserless' | 'concurrency'> &
+    Partial<Pick<BrowserlessToolDefinition<Schema>, 'concurrency'>>,
+): BrowserlessToolFactory<Schema> {
   return (args: ParsedArguments): BrowserlessToolDefinition<Schema> => {
     return {
+      concurrency: 'none',
       ...definition(args),
       browserless: true,
     };
@@ -604,7 +685,9 @@ export function isBrowserlessTool(
 export const CLOSE_PAGE_ERROR =
   'The last open page cannot be closed. It is fine to keep it open.';
 
-export const pageIdSchema = {
+export const pageIdSchema: {
+  pageId: zod.ZodNumber;
+} = {
   pageId: zod.number().describe('Targets a specific page by ID.'),
 };
 
@@ -624,7 +707,9 @@ export function zodTransform<Input, Output>(
   };
 }
 
-export const timeoutSchema = {
+export const timeoutSchema: {
+  timeout: zod.ZodOptional<zod.ZodType<number | undefined>>;
+} = {
   timeout: zod
     .number()
     .int()
@@ -750,12 +835,32 @@ export function isSlimTool(
 }
 
 /**
- * Slim mode replaces the regular tools with the slim tools. `--slim` requires
- * a restart, so the mode never changes while the server is running.
+ * Slim mode replaces the regular tools with the slim tools.
  */
 export function isAvailableInMode(
   tool: Pick<BaseToolDefinition, 'annotations'>,
   serverArgs: Pick<ParsedArguments, 'slim'>,
 ): boolean {
   return isSlimTool(tool) === Boolean(serverArgs.slim);
+}
+
+/**
+ * Returns whether a capability gate is enabled under the given arguments.
+ */
+export function isCapabilityEnabled(
+  gate: CapabilityGate,
+  serverArgs: ParsedArguments,
+): boolean {
+  if (Boolean(gate.conditions?.includes('slim')) !== Boolean(serverArgs.slim)) {
+    return false;
+  }
+  if (gate.category && !serverArgs[categoryToFlagName(gate.category)]) {
+    return false;
+  }
+  for (const condition of gate.conditions ?? []) {
+    if (!serverArgs[condition]) {
+      return false;
+    }
+  }
+  return true;
 }
